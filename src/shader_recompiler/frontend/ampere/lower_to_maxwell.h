@@ -413,6 +413,20 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             break;
         }
+        case 0x234: { // HSETP2, register form. Swizzles, compare ops and combine ops match Maxwell.
+            const auto a = half_source(0), b = half_source(1);
+            const u32 combine = insn.Bits(69, 2);
+            if (insn.Bits(9, 3) != 1 || insn.Bits(65, 1) || insn.Bits(91, 1) || combine > 2 ||
+                a.swizzle == 1 || b.swizzle == 1)
+                return fail(index, "native half compare mode");
+            emit(0x5d20000000000000ULL | predicate | insn.Bits(84, 3) | (u64{insn.Bits(81, 3)} << 3) |
+                 (u64{insn.Bits(80, 1)} << 6) | (u64{a.reg} << 8) | (u64{b.reg} << 20) |
+                 (u64{b.swizzle} << 28) | (u64{b.absolute} << 30) | (u64{b.negate} << 31) |
+                 (u64{insn.Bits(76, 4)} << 35) | (u64{insn.Bits(87, 3)} << 39) |
+                 (u64{insn.Bits(90, 1)} << 42) | (u64{a.negate} << 43) | (u64{a.absolute} << 44) |
+                 (u64{combine} << 45) | (u64{a.swizzle} << 47) | (u64{insn.Bits(71, 1)} << 49));
+            break;
+        }
         case 0x240: case 0x840: { // HMNMX2, exact half promotion for min/max
             if (insn.Bits(76, 11) || insn.Bits(91, 1))
                 return fail(index, "native half min/max mode");
