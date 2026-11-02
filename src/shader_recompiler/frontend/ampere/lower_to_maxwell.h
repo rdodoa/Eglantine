@@ -78,9 +78,11 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    u32 skipped_begin = 0, skipped_end = 0; // instructions folded into an earlier lowering
     for (u32 index = 0; index < code.size(); ++index) {
         auto insn = code[index];
         result.source_instruction_offsets.push_back(static_cast<u32>(result.instructions.size()));
+        if (index >= skipped_begin && index < skipped_end) continue;
         u32 opcode = insn.Bits(0, 12);
         if (insn.Bits(12, 4) == 15) continue; // @!PT: never executes (compiler padding)
         std::optional<u32> active_link;
@@ -1205,7 +1207,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         case 0x919: case 0x9c3: { // S2R / S2UR thread and workgroup identities.
             const u32 special = insn.Bits(72, 8);
             if (insn.words[1] || insn.words[2] != (special << 8) ||
-                (special != 0 && special != 33 && special != 34 && special != 35 &&
+                (special != 0 && special != 29 && special != 33 && special != 34 && special != 35 &&
                  special != 37 && special != 38 && special != 39 &&
                  special != 56 && special != 57 && special != 58 && special != 59 && special != 60))
                 return fail(index, "native special register");
@@ -1336,7 +1338,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         case 0x305: case 0xb05: case 0xd05: { // F2I NTZ, register/constant-buffer/uniform source
             const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
             const bool half = opcode == 0x305 && mode == 0x0010f000;
-            const bool small = mode == 0x00212800;
+            const bool small = (mode & ~0xc000U) == 0x00212800; // U16, any rounding (bits 78-79)
             const bool floor = (mode & ~0x10100U) == 0x00207000;
             const bool nearest = (mode & ~0x10100U) == 0x00203000;
             const bool ceil = (mode & ~0x10100U) == 0x0020b000;
@@ -1372,7 +1374,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             }
             emit(base(0x5cb0000000000000ULL) | (u64{small || byte ? 1U : 2U} << 8) | (u64{2} << 10) |
                  (u64{is_signed} << 12) | (u64{source} << 20) |
-                 (u64{small || nearest ? 0U : floor ? 1U : ceil ? 2U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
+                 (u64{small ? insn.Bits(78, 2) : nearest ? 0U : floor ? 1U : ceil ? 2U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
             if (!is_signed && !small) {
                 emit(base(0x5c40000000000000ULL) | (dest << 8) | (u64{251} << 20) |
                      (u64{1} << 41) | (u64{7} << 48));
@@ -2274,7 +2276,31 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             break;
         }
         default:
-            return fail(index, "unsupported native opcode");
+                        return fail(index, "unsupported native opcode");
+        case 0x34e: { // LEPC Rd: passthrough geometry prologue that sets the at-exit handler
+            // (LEPC; MOV Rt, imm; IADD3 Rd; IMAD.U32.X Rd+1; BMOV.64 ATEXIT_PC, Rd). The handler
+            // lies past the captured program and the host emits the passthrough primitive itself.
+            const auto op_at = [&](u32 offset) { return code[index + offset].Bits(0, 12); };
+            if (insn.words[1] || insn.words[2] || insn.Bits(12, 4) != 7 || dest > 245 ||
+                index + 4 >= code.size() || op_at(1) != 0x802 || op_at(2) != 0x210 ||
+                op_at(3) != 0x224 || op_at(4) != 0x357 ||
+                code[index + 2].Bits(16, 8) != dest || code[index + 3].Bits(16, 8) != dest + 1 ||
+                (code[index + 4].words[0] & ~0xff000000U) != 0x00007357U ||
+                code[index + 4].Bits(24, 8) != dest || code[index + 4].words[1] ||
+                code[index + 4].words[2])
+                return fail(index, "native LEPC mode");
+            mov_imm(static_cast<u32>(dest), 0);
+            mov_imm(static_cast<u32>(dest) + 1, 0);
+            skipped_begin = index + 2;
+            skipped_end = index + 5;
+            break;
+        }
+        case 0x923: { // ISBERD Rd, [Ra]: plain read of a geometry vertex handle (a vertex index here).
+            if (insn.words[1] || insn.words[2] || insn.Bits(12, 4) != 7)
+                return fail(index, "native stage buffer entry read mode");
+            emit(0xefd0000000000000ULL | predicate | dest | (u64{insn.Bits(24, 8)} << 8));
+            break;
+        }
         }
         if (!operand_error.empty()) return fail(index, operand_error);
         if (output_mask) {
