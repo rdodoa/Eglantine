@@ -323,13 +323,13 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
     } else if (static const bool trace = std::getenv("EDEN_NX2_GS_TRACE") != nullptr; trace) {
         // Draws a render-enable condition skips (EDEN_NX2_GS_TRACE): one line per program pair.
         static std::set<std::pair<u64, u64>> seen;
-        const auto& regs = maxwell3d.regs;
-        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        const auto& skipped_regs = maxwell3d.regs;
+        const u64 vs = (u64{skipped_regs.pipelines[1].reserved[0] & 0xff} << 32) | skipped_regs.pipelines[1].reserved[1];
+        const u64 ps = (u64{skipped_regs.pipelines[5].reserved[0] & 0xff} << 32) | skipped_regs.pipelines[5].reserved[1];
         if (seen.size() < 200 && seen.emplace(vs, ps).second) {
             LOG_INFO(HW_GPU, "Draw skipped by render condition: vs={:#x} ps={:#x} gs={} count={} rt0={:#x}",
-                     vs, ps, regs.IsShaderConfigEnabled(4), draw_state.draw_element_count,
-                     regs.rt[0].Address());
+                     vs, ps, skipped_regs.IsShaderConfigEnabled(4), draw_state.draw_element_count,
+                     skipped_regs.rt[0].Address());
         }
     }
 }
