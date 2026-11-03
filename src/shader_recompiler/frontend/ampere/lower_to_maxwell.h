@@ -83,9 +83,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    u32 skipped_begin = 0, skipped_end = 0; // instructions folded into an earlier lowering
     for (u32 index = 0; index < code.size(); ++index) {
         auto insn = code[index];
         result.source_instruction_offsets.push_back(static_cast<u32>(result.instructions.size()));
+        if (index >= skipped_begin && index < skipped_end) continue;
         u32 opcode = insn.Bits(0, 12);
         if (insn.Bits(12, 4) == 15) continue; // @!PT: never executes (compiler padding)
         u32 f16_dest = 255, f16_second = 255, f16_components = 0;
@@ -720,9 +722,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{insn.Bits(81, 3)} << 45) | (u64{insn.Bits(72, 2)} << 48));
             break;
         }
-        case 0x886: { // VOTEU ballot and independent uniform predicate output.
+         case 0x886: { // VOTEU ballot and independent uniform predicate output.
             const u32 output = insn.Bits(81, 3), target = insn.Bits(16, 8);
-            if ((target >= 16 && target != 63) || insn.words[1] ||
+            if (uniform_register(target) == ~0U || insn.words[1] ||
                 insn.Bits(72, 2) > 2 || native_predicate != 7)
                 return fail(index, "native uniform vote mode");
             const u32 temporary = output == 7 ? 7 : 6 - output;
@@ -876,11 +878,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                  (u64{high_result ? high_reg : low_reg} << 8) | (u64{insn.words[1]} << 20));
             break;
         }
-        case 0xb82: { // LDC.64 indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)
+        case 0xb82: { // LDC.U8/S8/U16/S16/32/64 indexed byte offset; bits 78-79 the mode as Maxwell's (2 = IS)
             // .IS: Ra + offset addresses all constant buffers as one space, the buffer in its high
             // half (Kirby Air Riders' vertex shaders), which Eden's Maxwell LDC implements.
             const u32 width = insn.Bits(73, 3), mode = insn.Bits(78, 2);
-            if ((width != 4 && width != 5) || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
+            if (width > 5 || (mode != 0 && mode != 2) || insn.Bits(91, 1) ||
                 bank() >= 18 ||
                 (width == 5 && ((dest & 1) || dest >= 254))) return fail(index, "native indexed constant load mode");
             emit(base(0xef90000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
@@ -1592,10 +1594,12 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const u32 mode = insn.words[2] & ~(opcode == 0xd05 ? 0x08000000U : 0U);
             // F16 source: bit 72 signs the result as in the other forms, bits 60-61 pick H0/H1.
             const bool half = opcode == 0x305 && (mode & ~0x100U) == 0x0010f000;
-            const bool small = mode == 0x00212800;
+            const bool small = (mode & ~0xc000U) == 0x00212800; // U16, any rounding (bits 78-79)
             const bool floor = (mode & ~0x10100U) == 0x00207000;
             const bool nearest = (mode & ~0x10100U) == 0x00203000;
-            if ((!half && !small && !floor && !nearest && (mode & ~0x10100U) != 0x0020f000) ||
+            const bool ceil = (mode & ~0x10100U) == 0x0020b000;
+            const bool byte = (mode & ~0x10000U) == 0x0020e100;
+            if ((!half && !small && !floor && !nearest && !ceil && !byte && (mode & ~0x10100U) != 0x0020f000) ||
                 (opcode != 0xb05 && (insn.words[1] & (half ? 0xefffff00U : 0xffffff00U))) ||
                 (opcode == 0xd05 && uniform_register(insn.Bits(32, 8)) == ~0U)) {
                 return fail(index, "native float-to-integer conversion mode");
@@ -1624,12 +1628,18 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 }
                 source = 250;
             }
-            emit(base(0x5cb0000000000000ULL) | (u64{small ? 1U : 2U} << 8) | (u64{2} << 10) |
+            emit(base(0x5cb0000000000000ULL) | (u64{small || byte ? 1U : 2U} << 8) | (u64{2} << 10) |
                  (u64{is_signed} << 12) | (u64{source} << 20) |
-                 (u64{small || nearest ? 0U : floor ? 1U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
+                 (u64{small ? insn.Bits(78, 2) : nearest ? 0U : floor ? 1U : ceil ? 2U : 3U} << 39) | (u64{insn.Bits(80, 1)} << 44));
             if (!is_signed && !small) {
                 emit(base(0x5c40000000000000ULL) | (dest << 8) | (u64{251} << 20) |
                      (u64{1} << 41) | (u64{7} << 48));
+            }
+            if (byte) {
+                emit(base(0x3820000000000000ULL) | (dest << 8) | (u64{127} << 20) |
+                     (u64{7} << 39) | (u64{1} << 48));
+                emit(base(0x3820000000000000ULL) | (dest << 8) | (u64{0x7ff80} << 20) |
+                     (u64{15} << 39) | (u64{1} << 48) | (u64{1} << 56));
             }
             break;
         }
@@ -2838,6 +2848,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
+            if (!write && insn.words[1] == 0 && insn.words[2] == 0 && insn.Bits(12, 4) == 7) {
+                // ISBERD Rd, [Ra] on the map region in a passthrough geometry program: the vertex
+                // handle of input vertex Ra. Eden's geometry stage addresses inputs by vertex
+                // index, which the Maxwell form copies.
+                emit(0xefd0000000000000ULL | predicate | dest | (u64{insn.Bits(24, 8)} << 8));
+                break;
+            }
             if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
                 (!write && region != 3) || (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");
@@ -2885,7 +2902,25 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             break;
         }
         default:
-            return fail(index, "unsupported native opcode");
+                        return fail(index, "unsupported native opcode");
+        case 0x34e: { // LEPC Rd: passthrough geometry prologue that sets the at-exit handler
+            // (LEPC; MOV Rt, imm; IADD3 Rd; IMAD.U32.X Rd+1; BMOV.64 ATEXIT_PC, Rd). The handler
+            // lies past the captured program and the host emits the passthrough primitive itself.
+            const auto op_at = [&](u32 offset) { return code[index + offset].Bits(0, 12); };
+            if (insn.words[1] || insn.words[2] || insn.Bits(12, 4) != 7 || dest > 245 ||
+                index + 4 >= code.size() || op_at(1) != 0x802 || op_at(2) != 0x210 ||
+                op_at(3) != 0x224 || op_at(4) != 0x357 ||
+                code[index + 2].Bits(16, 8) != dest || code[index + 3].Bits(16, 8) != dest + 1 ||
+                (code[index + 4].words[0] & ~0xff000000U) != 0x00007357U ||
+                code[index + 4].Bits(24, 8) != dest || code[index + 4].words[1] ||
+                code[index + 4].words[2])
+                return fail(index, "native LEPC mode");
+            mov_imm(static_cast<u32>(dest), 0);
+            mov_imm(static_cast<u32>(dest) + 1, 0);
+            skipped_begin = index + 2;
+            skipped_end = index + 5;
+            break;
+        }
         }
         if (!operand_error.empty()) return fail(index, operand_error);
         if (f16_components != 0) {
