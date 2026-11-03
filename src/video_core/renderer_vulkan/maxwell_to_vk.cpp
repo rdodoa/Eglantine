@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
 #include <iterator>
 
 #include "common/assert.h"
@@ -641,6 +643,18 @@ VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {
     }
     UNIMPLEMENTED_MSG("Unimplemented comparison op={}", comparison);
     return {};
+}
+
+VkCompareOp DepthComparisonOp(Maxwell::ComparisonOp comparison) {
+    static const int mode = [] {
+        const char* value = std::getenv("EDEN_NX2_DEPTH_EQUAL");
+        if (value == nullptr) return 0;
+        if (std::string_view{value} == "always") return 2;
+        return 1;
+    }();
+    const VkCompareOp op = ComparisonOp(comparison);
+    if (op != VK_COMPARE_OP_EQUAL || mode == 0) return op;
+    return mode == 2 ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL;
 }
 
 VkIndexType IndexFormat(Maxwell::IndexFormat index_format) {

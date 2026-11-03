@@ -2208,7 +2208,7 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
         return;
     }
     scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
+        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::DepthComparisonOp(func));
     });
 }
 

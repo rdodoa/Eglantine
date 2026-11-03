@@ -967,7 +967,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .depthTestEnable = dynamic.depth_test_enable,
         .depthWriteEnable = dynamic.depth_write_enable,
         .depthCompareOp = dynamic.depth_test_enable
-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              ? MaxwellToVK::DepthComparisonOp(dynamic.DepthTestFunc())
                               : VK_COMPARE_OP_ALWAYS,
         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
         .stencilTestEnable = dynamic.stencil_enable,
