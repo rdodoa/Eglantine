@@ -454,7 +454,58 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+
+namespace {
+// EDEN_NX2_GS_TRACE: describe each draw with a native geometry program and the draws that follow
+// it, flagging any that reads the geometry program's output list (its c0[0x420]) as indices or
+// indirect arguments (finds the pass that consumes a passthrough GS's triangle list).
+void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
+                            const char* kind) {
+    static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
+    if (!enabled) return;
+    static u32 follow{}, gs_draws{}, logged{};
+    static GPUVAddr counter{}, list{};
+    const auto& regs = maxwell3d.regs;
+    const auto& draw = maxwell3d.draw_manager;
+    const bool has_gs = regs.IsShaderConfigEnabled(4);
+    if (has_gs && gs_draws < 6) {
+        ++gs_draws;
+        const auto& cb0 = maxwell3d.state.shader_stages[3].const_buffers[0];
+        if (cb0.enabled && cb0.size >= 0x428) {
+            counter = memory.Read<u64>(cb0.address + 0x410);
+            list = memory.Read<u64>(cb0.address + 0x420);
+        }
+        follow = 80;
+        LOG_INFO(HW_GPU, "GS trace: geometry draw #{} counter={:#x} ({:#x}) list={:#x}", gs_draws,
+                 counter, counter ? memory.Read<u32>(counter) : 0U, list);
+    }
+    if (follow == 0 || logged >= 1200) return;
+    --follow;
+    ++logged;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    const auto& ib = draw.draw_state.index_buffer;
+    const auto& ind = draw.indirect_state;
+    const auto near = [](GPUVAddr a, GPUVAddr b) {
+        return a != 0 && b != 0 && a >= b - 0x100000 && a < b + 0x4000000;
+    };
+    const bool uses = near(ib.StartAddress(), list) || near(ind.indirect_start_address, list) ||
+                      near(ind.indirect_start_address, counter) || near(ind.count_start_address, counter);
+    LOG_INFO(HW_GPU,
+             "GS trace {}{}: gs={} vs={:#x} ps={:#x} rt0={:#x} fmt={:#x} {}x{} rts={} mask0={:#x} "
+             "depth test={} write={} func={} | ib={:#x} fmt={} first={} count={} | indirect={:#x} "
+             "count_addr={:#x} indexed={} max={}",
+             kind, uses ? " USES-GS-OUTPUT" : "", has_gs, vs, ps, regs.rt[0].Address(),
+             static_cast<u32>(regs.rt[0].format), regs.rt[0].width, regs.rt[0].height,
+             regs.rt_control.count.Value(), regs.color_mask[0].raw, regs.depth_test_enable,
+             regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func), ib.StartAddress(),
+             static_cast<u32>(ib.format), ib.first, ib.count, ind.indirect_start_address,
+             ind.count_start_address, ind.is_indexed, ind.max_draw_counts);
+}
+} // Anonymous namespace
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    TraceGeometryConsumers(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw");
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
@@ -604,6 +655,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    TraceGeometryConsumers(*maxwell3d, *gpu_memory, "draw-indirect");
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
