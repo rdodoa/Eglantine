@@ -456,9 +456,10 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 
 namespace {
-// EDEN_NX2_GS_TRACE: one line per distinct (vertex, pixel, geometry program, target) combination
-// with the depth and colour state, and the first code words of each program (to match them
-// with programs dumped in another run, whose addresses differ).
+// EDEN_NX2_GS_TRACE: after the first draw with a geometry program, one line per distinct
+// (vertex, pixel, geometry program, target) with the depth state, the viewport depth transform,
+// depth bias and the pixel program's header (to compare a depth pre-pass with the pass that
+// re-draws the same geometry with a depth-equal test).
 void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
                             const char* kind) {
     static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
@@ -469,33 +470,35 @@ void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::M
     };
     const u64 vs = address(1), ps = address(5);
     const u64 gs = regs.IsShaderConfigEnabled(4) ? address(4) : 0;
-    // Start once gameplay draws its terrain (the first draw with a geometry program).
     static bool started{};
     if (gs != 0) started = true;
     if (!started) return;
-    static std::set<std::tuple<u64, u64, u64, GPUVAddr>> seen;
-    if (seen.size() >= 900 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
-    const auto code = [&](u64 program) {
-        std::array<u32, 8> words{};
-        if (program != 0 && memory.IsFullyMappedRange(program + 0x80, sizeof(words))) {
-            memory.ReadBlockUnsafe(program + 0x80, words.data(), sizeof(words));
+    // Only the depth pre-pass with a geometry program and the depth-equal passes.
+    const u32 func = static_cast<u32>(regs.depth_test_func);
+    if (gs == 0 && func != 3 && func != 0x202) return;
+    static std::set<std::tuple<u64, u64, u64>> seen;
+    if (seen.size() >= 120 || !seen.emplace(vs, ps, gs).second) return;
+    const auto words = [&](u64 program, u32 offset) {
+        std::array<u32, 8> w{};
+        if (program != 0 && memory.IsFullyMappedRange(program + offset, sizeof(w))) {
+            memory.ReadBlockUnsafe(program + offset, w.data(), sizeof(w));
         }
-        return fmt::format("{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}", words[0], words[1],
-                           words[2], words[3], words[4], words[5], words[6], words[7]);
+        return fmt::format("{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}", w[0], w[1],
+                           w[2], w[3], w[4], w[5], w[6], w[7]);
     };
-    const auto& draw = maxwell3d.draw_manager;
-    const u32 count = draw.draw_state.draw_indexed ? draw.draw_state.index_buffer.count
-                                                   : draw.draw_state.vertex_buffer.count;
+    const auto& vt = regs.viewport_transform[0];
+    const auto& vp = regs.viewports[0];
     LOG_INFO(HW_GPU,
-             "PAIR #{} {} count={} vs={:#x} ps={:#x} gs={:#x} rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} "
-             "rts={} mask0={:#x} mask1={:#x} blend={} depth test={} write={} func={} | vscode={} "
-             "pscode={}",
-             seen.size(), kind, count, vs, ps, gs, regs.rt[0].Address(),
-             static_cast<u32>(regs.rt[0].format), regs.rt[0].width, regs.rt[0].height,
-             regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format), regs.rt_control.count.Value(),
-             regs.color_mask[0].raw, regs.color_mask[1].raw, regs.blend.enable[0],
-             regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
-             code(vs), code(ps));
+             "DEPTH #{} {} vs={:#x} ps={:#x} gs={:#x} func={:#x} write={} zeta={:#x}/{:#x} | vp0 "
+             "scale_z={} translate_z={} near={} far={} depth_mode={} depth01={} | bias fill={} "
+             "units={} slope={} clamp={} control={:#x} | vs head {} | vs code {} | ps head {} {} | "
+             "ps code {}",
+             seen.size(), kind, vs, ps, gs, func, regs.depth_write_enabled, regs.zeta.Address(),
+             static_cast<u32>(regs.zeta.format), vt.scale_z, vt.translate_z, vp.depth_range_near,
+             vp.depth_range_far, static_cast<u32>(regs.depth_mode), regs.viewport_clip_control.depth_0_to_1.Value(),
+             regs.polygon_offset_fill_enable, regs.depth_bias, regs.slope_scale_depth_bias,
+             regs.depth_bias_clamp, regs.depth_bias_control, words(vs, 0), words(vs, 0x80),
+             words(ps, 0), words(ps, 0x20), words(ps, 0x80));
 }
 } // Anonymous namespace
 
