@@ -644,6 +644,30 @@ void Maxwell3D::ProcessQueryGet() {
 }
 
 void Maxwell3D::ProcessQueryCondition() {
+    ProcessQueryConditionImpl();
+    // EDEN_NX2_FORCE_RENDER=1: ignore render-enable conditions (draw everything) to test whether
+    // a pass is skipped by a condition the GPU wrote. EDEN_NX2_GS_TRACE logs the conditions.
+    static const bool force = std::getenv("EDEN_NX2_FORCE_RENDER") != nullptr;
+    static const bool trace = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
+    if (trace) {
+        static u32 logged{};
+        static u32 seen{};
+        ++seen;
+        if (logged < 80 && (!execute_on || seen % 500 == 1)) {
+            ++logged;
+            std::array<u32, 4> words{};
+            const GPUVAddr address = regs.render_enable.Address();
+            if (address != 0) memory_manager.ReadBlockUnsafe(address, words.data(), sizeof(words));
+            LOG_INFO(HW_GPU, "Render condition #{}: override={} mode={} address={:#x} words={:08x} {:08x} {:08x} {:08x} -> {}{}",
+                     seen, static_cast<u32>(regs.render_enable_override),
+                     static_cast<u32>(regs.render_enable.mode), address, words[0], words[1], words[2],
+                     words[3], execute_on ? "draw" : "SKIP", force ? " (forced to draw)" : "");
+        }
+    }
+    if (force) execute_on = true;
+}
+
+void Maxwell3D::ProcessQueryConditionImpl() {
     if (rasterizer->AccelerateConditionalRendering()) {
         execute_on = true;
         return;
