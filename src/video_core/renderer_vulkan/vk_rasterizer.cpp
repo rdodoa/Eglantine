@@ -488,9 +488,16 @@ void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::M
     };
     if (has_gs) {
         ++gs_in_run;
-        if (gs_draws++ < 3) {
+        ++gs_draws;
+        // Every distinct pixel program / target / mask combination used with a geometry program.
+        static std::set<std::tuple<u64, GPUVAddr, GPUVAddr, u32, u32, u32>> combos;
+        if (combos.size() < 48 &&
+            combos.emplace(ps, regs.rt[0].Address(), regs.rt[1].Address(), regs.color_mask[0].raw,
+                           regs.color_mask[1].raw, regs.rt_control.count.Value())
+                .second) {
             ++logged;
-            LOG_INFO(HW_GPU, "GS trace {} with geometry: vs={:#x} ps={:#x} {}", kind, vs, ps, state());
+            LOG_INFO(HW_GPU, "GS trace {} with geometry (variant {}, draw {}): vs={:#x} ps={:#x} blend={} {}",
+                     kind, combos.size(), gs_draws, vs, ps, regs.blend.enable[0], state());
         }
         follow = 400;
         return;
