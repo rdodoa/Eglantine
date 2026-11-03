@@ -486,11 +486,11 @@ void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::M
     const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
     const auto& ib = draw.draw_state.index_buffer;
     const auto& ind = draw.indirect_state;
-    const auto near = [](GPUVAddr a, GPUVAddr b) {
+    const auto within_list = [](GPUVAddr a, GPUVAddr b) {
         return a != 0 && b != 0 && a >= b - 0x100000 && a < b + 0x4000000;
     };
-    const bool uses = near(ib.StartAddress(), list) || near(ind.indirect_start_address, list) ||
-                      near(ind.indirect_start_address, counter) || near(ind.count_start_address, counter);
+    const bool uses = within_list(ib.StartAddress(), list) || within_list(ind.indirect_start_address, list) ||
+                      within_list(ind.indirect_start_address, counter) || within_list(ind.count_start_address, counter);
     LOG_INFO(HW_GPU,
              "GS trace {}{}: gs={} vs={:#x} ps={:#x} rt0={:#x} fmt={:#x} {}x{} rts={} mask0={:#x} "
              "depth test={} write={} func={} | ib={:#x} fmt={} first={} count={} | indirect={:#x} "
