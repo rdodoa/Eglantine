@@ -1619,7 +1619,8 @@ void EmitContext::DefineOutputs(const IR::Program& program) {
     const std::optional<u32> invocations{program.invocations};
     if (runtime_info.convert_depth_mode || info.stores.AnyComponent(IR::Attribute::PositionX) ||
         stage == Stage::VertexB) {
-        output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+       output_position = DefineOutput(*this, F32[4], invocations, spv::BuiltIn::Position);
+        Decorate(output_position, spv::Decoration::Invariant); // same depth with or without a geometry stage
     }
     if (info.stores[IR::Attribute::PointSize] || runtime_info.fixed_state_point_size) {
         if (stage == Stage::Fragment) {
