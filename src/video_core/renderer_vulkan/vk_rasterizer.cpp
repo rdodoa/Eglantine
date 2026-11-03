@@ -456,84 +456,60 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 
 namespace {
-// EDEN_NX2_GS_TRACE: describe the draws with a native geometry program (the first few in full)
-// and the draws that follow the last of them, flagging any that reads a geometry program's
-// output list (its c0[0x420]) or counter (c0[0x410]) as indices or indirect arguments.
+// EDEN_NX2_GS_TRACE: describe the draws with a native geometry program (the first few) and,
+// after each run of them, the draws that test stencil or cover the screen (a full-screen
+// triangle or quad), with their depth, stencil and target state: finds the screen-space pass
+// that shades what the geometry draws only mark in depth/stencil.
 void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
                             const char* kind) {
     static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
     if (!enabled) return;
-    static u32 follow{}, gs_draws{}, logged{}, gs_in_run{};
-    static GPUVAddr list_low{~GPUVAddr{0}}, list_high{}, counter_low{~GPUVAddr{0}}, counter_high{};
+    static u32 follow{}, gs_draws{}, logged{}, gs_in_run{}, runs{};
     if (logged >= 1500) return;
     const auto& regs = maxwell3d.regs;
     const auto& draw = maxwell3d.draw_manager;
     const bool has_gs = regs.IsShaderConfigEnabled(4);
     const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
     const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-    const u64 gs = (u64{regs.pipelines[4].reserved[0] & 0xff} << 32) | regs.pipelines[4].reserved[1];
-    const auto targets = [&] {
-        std::string text;
-        for (u32 i = 0; i < 4; ++i) {
-            text += fmt::format(" rt{}={:#x}/{:#x}/{}x{}/mask{:#x}", i, regs.rt[i].Address(),
-                                static_cast<u32>(regs.rt[i].format), regs.rt[i].width,
-                                regs.rt[i].height, regs.color_mask[i].raw);
-        }
-        return text;
+    const auto state = [&] {
+        const auto& f = regs.stencil_front_op;
+        return fmt::format(
+            "rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} rts={} mask0={:#x} mask1={:#x} | zeta={:#x}/{:#x} en={} "
+            "depth test={} write={} func={} | stencil en={} func={} ref={:#x} fmask={:#x} wmask={:#x} "
+            "ops fail={:#x} zfail={:#x} zpass={:#x} two_side={}",
+            regs.rt[0].Address(), static_cast<u32>(regs.rt[0].format), regs.rt[0].width,
+            regs.rt[0].height, regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format),
+            regs.rt_control.count.Value(), regs.color_mask[0].raw, regs.color_mask[1].raw,
+            regs.zeta.Address(), static_cast<u32>(regs.zeta.format), regs.zeta_enable,
+            regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
+            regs.stencil_enable, static_cast<u32>(f.func), regs.stencil_front_ref,
+            regs.stencil_front_func_mask, regs.stencil_front_mask, static_cast<u32>(f.fail),
+            static_cast<u32>(f.zfail), static_cast<u32>(f.zpass), regs.stencil_two_side_enable);
     };
     if (has_gs) {
-        const auto& cb0 = maxwell3d.state.shader_stages[3].const_buffers[0];
-        if (cb0.enabled && cb0.size >= 0x428) {
-            const GPUVAddr counter = memory.Read<u64>(cb0.address + 0x410);
-            const GPUVAddr list = memory.Read<u64>(cb0.address + 0x420);
-            list_low = (std::min)(list_low, list);
-            list_high = (std::max)(list_high, list);
-            counter_low = (std::min)(counter_low, counter);
-            counter_high = (std::max)(counter_high, counter);
-        }
         ++gs_in_run;
-        if (gs_draws++ < 4) {
+        if (gs_draws++ < 3) {
             ++logged;
-            LOG_INFO(HW_GPU,
-                     "GS trace {} with geometry: vs={:#x} gs={:#x} ps={:#x} rt_control={:#x} "
-                     "mask_common={}{} depth test={} write={} func={} | ib={:#x} count={} | "
-                     "lists {:#x}..{:#x} counters {:#x}..{:#x}",
-                     kind, vs, gs, ps, regs.rt_control.count.Value() |
-                         (regs.rt_control.target0.Value() << 4) | (regs.rt_control.target1.Value() << 7),
-                     regs.color_mask_common, targets(), regs.depth_test_enable,
-                     regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
-                     draw.draw_state.index_buffer.StartAddress(), draw.draw_state.index_buffer.count,
-                     list_low, list_high, counter_low, counter_high);
+            LOG_INFO(HW_GPU, "GS trace {} with geometry: vs={:#x} ps={:#x} {}", kind, vs, ps, state());
         }
-        follow = 150;
+        follow = 400;
         return;
     }
     if (follow == 0) return;
     if (gs_in_run != 0) {
         ++logged;
-        LOG_INFO(HW_GPU, "GS trace: run of {} geometry draws ended; lists {:#x}..{:#x} counters {:#x}..{:#x}",
-                 gs_in_run, list_low, list_high, counter_low, counter_high);
+        ++runs;
+        LOG_INFO(HW_GPU, "GS trace: run {} of {} geometry draws ended", runs, gs_in_run);
         gs_in_run = 0;
     }
     --follow;
+    const u32 count = draw.draw_state.draw_indexed ? draw.draw_state.index_buffer.count
+                                                   : draw.draw_state.vertex_buffer.count;
+    const bool screen = count <= 6;
+    if (!regs.stencil_enable && !screen) return;
     ++logged;
-    const auto& ib = draw.draw_state.index_buffer;
-    const auto& ind = draw.indirect_state;
-    const auto inside = [](GPUVAddr a, GPUVAddr low, GPUVAddr high) {
-        return a != 0 && low <= high && a + 0x40000 >= low && a <= high + 0x40000;
-    };
-    const bool uses = inside(ib.StartAddress(), list_low, list_high) ||
-                      inside(ind.indirect_start_address, list_low, list_high) ||
-                      inside(ind.indirect_start_address, counter_low, counter_high) ||
-                      inside(ind.count_start_address, counter_low, counter_high);
-    LOG_INFO(HW_GPU,
-             "GS trace {}{}: vs={:#x} ps={:#x} rts={} common={}{} depth test={} write={} func={} | "
-             "ib={:#x} fmt={} first={} count={} | indirect={:#x} count_addr={:#x} indexed={} max={}",
-             kind, uses ? " USES-GS-OUTPUT" : "", vs, ps, regs.rt_control.count.Value(),
-             regs.color_mask_common, targets(), regs.depth_test_enable, regs.depth_write_enabled,
-             static_cast<u32>(regs.depth_test_func), ib.StartAddress(), static_cast<u32>(ib.format),
-             ib.first, ib.count, ind.indirect_start_address, ind.count_start_address, ind.is_indexed,
-             ind.max_draw_counts);
+    LOG_INFO(HW_GPU, "GS trace {}{} count={}: vs={:#x} ps={:#x} {}", kind,
+             screen ? " SCREEN" : "", count, vs, ps, state());
 }
 } // Anonymous namespace
 
