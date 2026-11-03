@@ -558,7 +558,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
                           program == Maxwell::ShaderType::Tessellation)};
     if (native) {
         if (program != Maxwell::ShaderType::VertexB && program != Maxwell::ShaderType::Pixel &&
-            !mesh_slot) {
+            !mesh_slot && !(program == Maxwell::ShaderType::Geometry && sph.common0.geometry_passthrough != 0)) {
             throw Shader::RuntimeError("Unsupported native graphics shader stage {}", static_cast<u32>(program));
         }
         if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS")) {
