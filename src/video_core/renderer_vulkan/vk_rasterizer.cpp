@@ -469,8 +469,12 @@ void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::M
     };
     const u64 vs = address(1), ps = address(5);
     const u64 gs = regs.IsShaderConfigEnabled(4) ? address(4) : 0;
+    // Start once gameplay draws its terrain (the first draw with a geometry program).
+    static bool started{};
+    if (gs != 0) started = true;
+    if (!started) return;
     static std::set<std::tuple<u64, u64, u64, GPUVAddr>> seen;
-    if (seen.size() >= 700 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
+    if (seen.size() >= 900 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
     const auto code = [&](u64 program) {
         std::array<u32, 8> words{};
         if (program != 0 && memory.IsFullyMappedRange(program + 0x80, sizeof(words))) {
