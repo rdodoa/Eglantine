@@ -456,67 +456,42 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 
 namespace {
-// EDEN_NX2_GS_TRACE: describe the draws with a native geometry program (the first few) and,
-// after each run of them, the draws that test stencil or cover the screen (a full-screen
-// triangle or quad), with their depth, stencil and target state: finds the screen-space pass
-// that shades what the geometry draws only mark in depth/stencil.
+// EDEN_NX2_GS_TRACE: one line per distinct (vertex, pixel, geometry program, target) combination
+// with the depth and colour state, and the first code words of each program (to match them
+// with programs dumped in another run, whose addresses differ).
 void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
                             const char* kind) {
     static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
     if (!enabled) return;
-    static u32 follow{}, gs_draws{}, logged{}, gs_in_run{}, runs{};
-    if (logged >= 1500) return;
     const auto& regs = maxwell3d.regs;
-    const auto& draw = maxwell3d.draw_manager;
-    const bool has_gs = regs.IsShaderConfigEnabled(4);
-    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-    const auto state = [&] {
-        const auto& f = regs.stencil_front_op;
-        return fmt::format(
-            "rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} rts={} mask0={:#x} mask1={:#x} | zeta={:#x}/{:#x} en={} "
-            "depth test={} write={} func={} | stencil en={} func={} ref={:#x} fmask={:#x} wmask={:#x} "
-            "ops fail={:#x} zfail={:#x} zpass={:#x} two_side={}",
-            regs.rt[0].Address(), static_cast<u32>(regs.rt[0].format), regs.rt[0].width,
-            regs.rt[0].height, regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format),
-            regs.rt_control.count.Value(), regs.color_mask[0].raw, regs.color_mask[1].raw,
-            regs.zeta.Address(), static_cast<u32>(regs.zeta.format), regs.zeta_enable,
-            regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
-            regs.stencil_enable, static_cast<u32>(f.func), regs.stencil_front_ref,
-            regs.stencil_front_func_mask, regs.stencil_front_mask, static_cast<u32>(f.fail),
-            static_cast<u32>(f.zfail), static_cast<u32>(f.zpass), regs.stencil_two_side_enable);
+    const auto address = [&](size_t stage) {
+        return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
     };
-    if (has_gs) {
-        ++gs_in_run;
-        ++gs_draws;
-        // Every distinct pixel program / target / mask combination used with a geometry program.
-        static std::set<std::tuple<u64, GPUVAddr, GPUVAddr, u32, u32, u32>> combos;
-        if (combos.size() < 48 &&
-            combos.emplace(ps, regs.rt[0].Address(), regs.rt[1].Address(), regs.color_mask[0].raw,
-                           regs.color_mask[1].raw, regs.rt_control.count.Value())
-                .second) {
-            ++logged;
-            LOG_INFO(HW_GPU, "GS trace {} with geometry (variant {}, draw {}): vs={:#x} ps={:#x} blend={} {}",
-                     kind, combos.size(), gs_draws, vs, ps, regs.blend.enable[0], state());
+    const u64 vs = address(1), ps = address(5);
+    const u64 gs = regs.IsShaderConfigEnabled(4) ? address(4) : 0;
+    static std::set<std::tuple<u64, u64, u64, GPUVAddr>> seen;
+    if (seen.size() >= 700 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
+    const auto code = [&](u64 program) {
+        std::array<u32, 8> words{};
+        if (program != 0 && memory.IsFullyMappedRange(program + 0x80, sizeof(words))) {
+            memory.ReadBlockUnsafe(program + 0x80, words.data(), sizeof(words));
         }
-        follow = 400;
-        return;
-    }
-    if (follow == 0) return;
-    if (gs_in_run != 0) {
-        ++logged;
-        ++runs;
-        LOG_INFO(HW_GPU, "GS trace: run {} of {} geometry draws ended", runs, gs_in_run);
-        gs_in_run = 0;
-    }
-    --follow;
+        return fmt::format("{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}", words[0], words[1],
+                           words[2], words[3], words[4], words[5], words[6], words[7]);
+    };
+    const auto& draw = maxwell3d.draw_manager;
     const u32 count = draw.draw_state.draw_indexed ? draw.draw_state.index_buffer.count
                                                    : draw.draw_state.vertex_buffer.count;
-    const bool screen = count <= 6;
-    if (!regs.stencil_enable && !screen) return;
-    ++logged;
-    LOG_INFO(HW_GPU, "GS trace {}{} count={}: vs={:#x} ps={:#x} {}", kind,
-             screen ? " SCREEN" : "", count, vs, ps, state());
+    LOG_INFO(HW_GPU,
+             "PAIR #{} {} count={} vs={:#x} ps={:#x} gs={:#x} rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} "
+             "rts={} mask0={:#x} mask1={:#x} blend={} depth test={} write={} func={} | vscode={} "
+             "pscode={}",
+             seen.size(), kind, count, vs, ps, gs, regs.rt[0].Address(),
+             static_cast<u32>(regs.rt[0].format), regs.rt[0].width, regs.rt[0].height,
+             regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format), regs.rt_control.count.Value(),
+             regs.color_mask[0].raw, regs.color_mask[1].raw, regs.blend.enable[0],
+             regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
+             code(vs), code(ps));
 }
 } // Anonymous namespace
 
