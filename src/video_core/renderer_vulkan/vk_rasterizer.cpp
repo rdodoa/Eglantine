@@ -286,38 +286,78 @@ bool RasterizerVulkan::TryNx2IndirectReset() {
         !gpu_memory->IsFullyMappedRange(range->begin, range->size)) {
         return reject("list outside mapped descriptor");
     }
-    if (gpu_memory->IsMemoryDirty(range->begin, range->size, VideoCommon::CacheType::BufferCache)) {
+    using Clock = std::chrono::steady_clock;
+    const auto start_time = Clock::now();
+    const bool flushed =
+        gpu_memory->IsMemoryDirty(range->begin, range->size, VideoCommon::CacheType::BufferCache);
+    if (flushed) {
         gpu_memory->FlushRegion(range->begin, range->size, VideoCommon::CacheType::BufferCache);
     }
     std::vector<u64> pointers(count);
     gpu_memory->ReadBlockUnsafe(range->begin, pointers.data(), range->size);
     static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+    static constexpr u64 record_size = sizeof(record);
     for (const u64 pointer : pointers) {
         if (!pointer) {
             continue;
         }
-        if (!in_gpu_range(pointer, sizeof(record)) ||
-            !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+        if (!in_gpu_range(pointer, record_size) ||
+            !gpu_memory->IsFullyMappedRange(pointer, record_size)) {
             return reject("record not mapped");
         }
-        if (pointer < range->begin + range->size && range->begin < pointer + sizeof(record)) {
+        if (pointer < range->begin + range->size && range->begin < pointer + record_size) {
             return reject("record overlaps pointer list");
         }
-        const auto segments = gpu_memory->GetSubmappedRange(pointer, sizeof(record));
-        if (segments.size() != 1 || segments[0].first != pointer ||
-            segments[0].second != sizeof(record)) {
-            return reject("record crosses a mapping boundary");
-        }
     }
-    const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
-    for (const u64 pointer : pointers) {
-        if (pointer) {
-            AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+    // Write the records in contiguous runs (one upload per run instead of one per record:
+    // ~1400 records per frame, each its own copy and barrier, cost a lot of frame time).
+    std::erase(pointers, u64{0});
+    std::ranges::sort(pointers);
+    pointers.erase(std::unique(pointers.begin(), pointers.end()), pointers.end());
+    static std::vector<u8> pattern;
+    const auto write_run = [&](u64 begin, u64 end) {
+        const size_t size = static_cast<size_t>(end - begin);
+        const auto segments = gpu_memory->GetSubmappedRange(begin, size);
+        if (segments.size() == 1 && segments[0].first == begin && segments[0].second == size) {
+            if (pattern.size() < size) {
+                const size_t old_size = pattern.size();
+                pattern.resize(size);
+                for (size_t offset = old_size; offset < size; offset += record_size) {
+                    std::memcpy(pattern.data() + offset, record.data(), record_size);
+                }
+            }
+            AccelerateInlineToMemory(begin, size, std::span<const u8>{pattern.data(), size});
+            return size_t{1};
         }
+        const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), record_size};
+        size_t writes = 0;
+        for (u64 pointer = begin; pointer < end; pointer += record_size, ++writes) {
+            AccelerateInlineToMemory(pointer, record_size, bytes);
+        }
+        return writes;
+    };
+    size_t writes = 0;
+    for (size_t i = 0; i < pointers.size();) {
+        size_t j = i + 1;
+        while (j < pointers.size() && pointers[j] == pointers[j - 1] + record_size) {
+            ++j;
+        }
+        writes += write_run(pointers[i], pointers[j - 1] + record_size);
+        i = j;
     }
     static u32 reported{};
     if (reported++ < 5) {
         LOG_INFO(HW_GPU, "Experimental indirect reset: {} records", count);
+    }
+    static u64 timed_calls{}, total_us{}, flushes{};
+    total_us += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start_time).count());
+    flushes += flushed ? 1 : 0;
+    if (++timed_calls == 600) {
+        LOG_INFO(HW_GPU,
+                 "Indirect reset cost: {} records, {} unique, {} uploads, mean {} us, flushes {}/600",
+                 count, pointers.size(), writes, total_us / timed_calls, flushes);
+        timed_calls = total_us = flushes = 0;
     }
     return true;
 }
