@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <memory>
+#include <limits>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -14,6 +16,8 @@
 #include <set>
 #include <fstream>
 #include <mutex>
+#include <string_view>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -28,6 +32,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/native_query_trace.h"
+#include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -241,6 +246,82 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+// Experimental adaptation of PokeDinner commit 76df4591a747: execute the reset shader's
+// indirect record writes on the host until general GPU-address translation is available.
+bool RasterizerVulkan::TryNx2IndirectReset() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_RESETFIX");
+        return !value || std::string_view{value} != "0";
+    }();
+    if (!enabled || !maxwell3d->GetNativeMacroEngine().native_turing ||
+        !pipeline_cache.IsIndirectResetShader()) {
+        return false;
+    }
+    const auto reject = [](std::string_view reason) {
+        static u32 reported_rejections{};
+        if (reported_rejections++ < 8) {
+            LOG_WARNING(HW_GPU, "Experimental indirect reset skipped: {}", reason);
+        }
+        return false;
+    };
+    const auto in_gpu_range = [this](u64 address, size_t size) {
+        return size != 0 && address <= (std::numeric_limits<u64>::max)() - size &&
+               gpu_memory->IsWithinGPUAddressRange(address) &&
+               gpu_memory->IsWithinGPUAddressRange(address + size - 1);
+    };
+    const auto& cbuf = maxwell3d->state.shader_stages[0].const_buffers[0];
+    if (!cbuf.enabled || cbuf.size < 0x120 || !in_gpu_range(cbuf.address, 0x120) ||
+        !gpu_memory->IsFullyMappedRange(cbuf.address + 0x110, 16)) {
+        return reject("descriptor unavailable");
+    }
+    std::array<u64, 2> descriptor{};
+    gpu_memory->ReadBlock(cbuf.address + 0x110, descriptor.data(), sizeof(descriptor));
+    const u64 list = descriptor[0];
+    const auto& draw = maxwell3d->draw_manager.draw_state;
+    const u64 first = draw.vertex_buffer.first;
+    const u64 count = draw.vertex_buffer.count;
+    const auto range = VideoCommon::IndirectResetRange(list, static_cast<u32>(descriptor[1]),
+                                                        first, count);
+    if (!range || !in_gpu_range(range->begin, range->size) ||
+        !gpu_memory->IsFullyMappedRange(range->begin, range->size)) {
+        return reject("list outside mapped descriptor");
+    }
+    if (gpu_memory->IsMemoryDirty(range->begin, range->size, VideoCommon::CacheType::BufferCache)) {
+        gpu_memory->FlushRegion(range->begin, range->size, VideoCommon::CacheType::BufferCache);
+    }
+    std::vector<u64> pointers(count);
+    gpu_memory->ReadBlockUnsafe(range->begin, pointers.data(), range->size);
+    static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+    for (const u64 pointer : pointers) {
+        if (!pointer) {
+            continue;
+        }
+        if (!in_gpu_range(pointer, sizeof(record)) ||
+            !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+            return reject("record not mapped");
+        }
+        if (pointer < range->begin + range->size && range->begin < pointer + sizeof(record)) {
+            return reject("record overlaps pointer list");
+        }
+        const auto segments = gpu_memory->GetSubmappedRange(pointer, sizeof(record));
+        if (segments.size() != 1 || segments[0].first != pointer ||
+            segments[0].second != sizeof(record)) {
+            return reject("record crosses a mapping boundary");
+        }
+    }
+    const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
+    for (const u64 pointer : pointers) {
+        if (pointer) {
+            AccelerateInlineToMemory(pointer, bytes.size(), bytes);
+        }
+    }
+    static u32 reported{};
+    if (reported++ < 5) {
+        LOG_INFO(HW_GPU, "Experimental indirect reset: {} records", count);
+    }
+    return true;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
@@ -278,6 +359,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
     }()};
     if (!pipeline) {
         report_failure("no pipeline");
+        return;
+    }
+    if (!is_indexed && TryNx2IndirectReset()) {
+        submitted = true;
         return;
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
@@ -456,10 +541,9 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 
 
 namespace {
-// EDEN_NX2_GS_TRACE: after the first draw with a geometry program, one line per distinct
-// (vertex, pixel, geometry program, target) with the depth state, the viewport depth transform,
-// depth bias and the pixel program's header (to compare a depth pre-pass with the pass that
-// re-draws the same geometry with a depth-equal test).
+// EDEN_NX2_GS_TRACE: one line per distinct (vertex, pixel, geometry program, target) combination
+// with the depth and colour state, and the first code words of each program (to match them
+// with programs dumped in another run, whose addresses differ).
 void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
                             const char* kind) {
     static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
@@ -470,35 +554,33 @@ void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::M
     };
     const u64 vs = address(1), ps = address(5);
     const u64 gs = regs.IsShaderConfigEnabled(4) ? address(4) : 0;
+    // Start once gameplay draws its terrain (the first draw with a geometry program).
     static bool started{};
     if (gs != 0) started = true;
     if (!started) return;
-    // Only the depth pre-pass with a geometry program and the depth-equal passes.
-    const u32 func = static_cast<u32>(regs.depth_test_func);
-    if (gs == 0 && func != 3 && func != 0x202) return;
-    static std::set<std::tuple<u64, u64, u64>> seen;
-    if (seen.size() >= 120 || !seen.emplace(vs, ps, gs).second) return;
-    const auto words = [&](u64 program, u32 offset) {
-        std::array<u32, 8> w{};
-        if (program != 0 && memory.IsFullyMappedRange(program + offset, sizeof(w))) {
-            memory.ReadBlockUnsafe(program + offset, w.data(), sizeof(w));
+    static std::set<std::tuple<u64, u64, u64, GPUVAddr>> seen;
+    if (seen.size() >= 900 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
+    const auto code = [&](u64 program) {
+        std::array<u32, 8> words{};
+        if (program != 0 && memory.IsFullyMappedRange(program + 0x80, sizeof(words))) {
+            memory.ReadBlockUnsafe(program + 0x80, words.data(), sizeof(words));
         }
-        return fmt::format("{:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}", w[0], w[1],
-                           w[2], w[3], w[4], w[5], w[6], w[7]);
+        return fmt::format("{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}", words[0], words[1],
+                           words[2], words[3], words[4], words[5], words[6], words[7]);
     };
-    const auto& vt = regs.viewport_transform[0];
-    const auto& vp = regs.viewports[0];
+    const auto& draw = maxwell3d.draw_manager;
+    const u32 count = draw.draw_state.draw_indexed ? draw.draw_state.index_buffer.count
+                                                   : draw.draw_state.vertex_buffer.count;
     LOG_INFO(HW_GPU,
-             "DEPTH #{} {} vs={:#x} ps={:#x} gs={:#x} func={:#x} write={} zeta={:#x}/{:#x} | vp0 "
-             "scale_z={} translate_z={} near={} far={} depth_mode={} depth01={} | bias fill={} "
-             "units={} slope={} clamp={} control={:#x} | vs head {} | vs code {} | ps head {} {} | "
-             "ps code {}",
-             seen.size(), kind, vs, ps, gs, func, regs.depth_write_enabled, regs.zeta.Address(),
-             static_cast<u32>(regs.zeta.format), vt.scale_z, vt.translate_z, vp.depth_range_near,
-             vp.depth_range_far, static_cast<u32>(regs.depth_mode), regs.viewport_clip_control.depth_0_to_1.Value(),
-             regs.polygon_offset_fill_enable, regs.depth_bias, regs.slope_scale_depth_bias,
-             regs.depth_bias_clamp, regs.depth_bias_control, words(vs, 0), words(vs, 0x80),
-             words(ps, 0), words(ps, 0x20), words(ps, 0x80));
+             "PAIR #{} {} count={} vs={:#x} ps={:#x} gs={:#x} rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} "
+             "rts={} mask0={:#x} mask1={:#x} blend={} depth test={} write={} func={} | vscode={} "
+             "pscode={}",
+             seen.size(), kind, count, vs, ps, gs, regs.rt[0].Address(),
+             static_cast<u32>(regs.rt[0].format), regs.rt[0].width, regs.rt[0].height,
+             regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format), regs.rt_control.count.Value(),
+             regs.color_mask[0].raw, regs.color_mask[1].raw, regs.blend.enable[0],
+             regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
+             code(vs), code(ps));
 }
 } // Anonymous namespace
 
