@@ -3324,6 +3324,7 @@ private:
 
     /// Handles conditional rendering.
     void ProcessQueryCondition();
+    void ProcessQueryConditionImpl();
 
     /// Handles counter resets.
     void ProcessCounterReset();

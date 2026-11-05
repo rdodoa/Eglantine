@@ -3286,6 +3286,13 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             const bool write = opcode == 0x927;
             const u32 region = insn.Bits(76, 2);
             const bool output = insn.Bits(79, 1) != 0;
+            if (options.geometry && !write && !insn.words[1] && !insn.words[2] &&
+                insn.Bits(24, 8) != 255 && dest != 255) {
+                // The geometry map form maps a vertex index to itself in the Maxwell frontend.
+                emit(base(0x5c98000000000000ULL) | (u64{15} << 39) |
+                     (u64{insn.Bits(24, 8)} << 20));
+                break;
+            }
             if ((insn.words[2] & ~0xf800U) != 0 || (region != 0 && region != 3) || write != output ||
                 (!write && region != 3) || (!write && dest == 255))
                 return fail(index, "native stage buffer access mode");

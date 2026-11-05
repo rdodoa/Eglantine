@@ -543,7 +543,53 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+
+namespace {
+// EDEN_NX2_GS_TRACE: one line per distinct (vertex, pixel, geometry program, target) combination
+// with the depth and colour state, and the first code words of each program (to match them
+// with programs dumped in another run, whose addresses differ).
+void TraceGeometryConsumers(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::MemoryManager& memory,
+                            const char* kind) {
+    static const bool enabled = std::getenv("EDEN_NX2_GS_TRACE") != nullptr;
+    if (!enabled) return;
+    const auto& regs = maxwell3d.regs;
+    const auto address = [&](size_t stage) {
+        return (u64{regs.pipelines[stage].reserved[0] & 0xff} << 32) | regs.pipelines[stage].reserved[1];
+    };
+    const u64 vs = address(1), ps = address(5);
+    const u64 gs = regs.IsShaderConfigEnabled(4) ? address(4) : 0;
+    // Start once gameplay draws its terrain (the first draw with a geometry program).
+    static bool started{};
+    if (gs != 0) started = true;
+    if (!started) return;
+    static std::set<std::tuple<u64, u64, u64, GPUVAddr>> seen;
+    if (seen.size() >= 900 || !seen.emplace(vs, ps, gs, regs.rt[0].Address()).second) return;
+    const auto code = [&](u64 program) {
+        std::array<u32, 8> words{};
+        if (program != 0 && memory.IsFullyMappedRange(program + 0x80, sizeof(words))) {
+            memory.ReadBlockUnsafe(program + 0x80, words.data(), sizeof(words));
+        }
+        return fmt::format("{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}", words[0], words[1],
+                           words[2], words[3], words[4], words[5], words[6], words[7]);
+    };
+    const auto& draw = maxwell3d.draw_manager;
+    const u32 count = draw.draw_state.draw_indexed ? draw.draw_state.index_buffer.count
+                                                   : draw.draw_state.vertex_buffer.count;
+    LOG_INFO(HW_GPU,
+             "PAIR #{} {} count={} vs={:#x} ps={:#x} gs={:#x} rt0={:#x}/{:#x}/{}x{} rt1={:#x}/{:#x} "
+             "rts={} mask0={:#x} mask1={:#x} blend={} depth test={} write={} func={} | vscode={} "
+             "pscode={}",
+             seen.size(), kind, count, vs, ps, gs, regs.rt[0].Address(),
+             static_cast<u32>(regs.rt[0].format), regs.rt[0].width, regs.rt[0].height,
+             regs.rt[1].Address(), static_cast<u32>(regs.rt[1].format), regs.rt_control.count.Value(),
+             regs.color_mask[0].raw, regs.color_mask[1].raw, regs.blend.enable[0],
+             regs.depth_test_enable, regs.depth_write_enabled, static_cast<u32>(regs.depth_test_func),
+             code(vs), code(ps));
+}
+} // Anonymous namespace
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+    TraceGeometryConsumers(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw");
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     {
         // A draw's first and count can come from memory a skipped (rejected) compute program
@@ -711,6 +757,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 }
 
 void RasterizerVulkan::DrawIndirect() {
+    TraceGeometryConsumers(*maxwell3d, *gpu_memory, "draw-indirect");
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
     buffer_cache.SetDrawIndirect(&params);
@@ -2294,7 +2341,7 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
         return;
     }
     scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
+        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::DepthComparisonOp(func));
     });
 }
 

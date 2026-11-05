@@ -40,6 +40,12 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
                                                           VideoCommon::CacheType::BufferCache)) {
         dma_pusher.rasterizer->FlushRegion(*device, sizeof(u32),
                                            VideoCommon::CacheType::BufferCache);
+        if (VideoCommon::Nx2Profile::Enabled()) {
+            static u64 flushes{};
+            if (++flushes % 20000 == 0) {
+                LOG_INFO(HW_GPU, "Semaphore words flushed from the host GPU: {}", flushes);
+            }
+        }
     }
     return dma_pusher.memory_manager.Read<u32>(address);
 }
@@ -59,6 +65,27 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain();
 }
 
+// Semaphores here count up, so a value already met in guest memory is not taken back by a
+// release still in the host GPU's caches: check guest memory before flushing the word from the
+// host GPU (a wait for it each time a pending channel is polled, thousands of times a second).
+// Adapted from Selevet Eglantine's acquire peek. EDEN_NX2_ACQUIRE_PEEK=0 always flushes first.
+bool PeekAcquire(DmaPusher& dma_pusher, const Puller::PendingAcquire& acquire) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_PEEK");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!enabled || !acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+        return false;
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        static u64 peeks{};
+        if (++peeks % 100000 == 0) {
+            LOG_INFO(HW_GPU, "Semaphore acquires met in guest memory without a flush: {}", peeks);
+        }
+    }
+    return true;
+}
+
 } // Anonymous namespace
 
 bool Puller::PendingAcquire::Matches(u32 current) const {
@@ -76,6 +103,9 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (!VideoCommon::GpuSplit::Get().Active() && PeekAcquire(dma_pusher, *pending_acquire)) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -250,6 +280,9 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (!VideoCommon::GpuSplit::Get().Active() && PeekAcquire(dma_pusher, acquire)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
