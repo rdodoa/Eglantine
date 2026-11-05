@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -551,6 +552,24 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    // EDEN_NX2_CBUF_TRACE: once per program, log constant bank 0's address and size and its first
+    // 0x80 bytes (as hex words), to check what a native compute program reads from it.
+    if (static const bool cbuf_trace = std::getenv("EDEN_NX2_CBUF_TRACE") != nullptr; cbuf_trace) {
+        static std::unordered_set<u64> traced_programs;
+        const u64 program = (u64{qmd[49] & 0x1ffff} << 32) | qmd[48];
+        if (traced_programs.insert(program).second) {
+            const auto& bank = launch_description.const_buffer_config[0];
+            const GPUVAddr address = (GPUVAddr{bank.address_high} << 32) | bank.address_low;
+            std::array<u32, 32> words{};
+            memory_manager.ReadBlockUnsafe(address, words.data(), sizeof(words));
+            std::string text;
+            for (u32 i = 0; i < words.size(); ++i) {
+                text += fmt::format("{}{:08x}", i % 4 == 0 ? " |" : " ", words[i]);
+            }
+            LOG_INFO(HW_GPU, "Native compute {:#x}: banks {:#x} cbuf0 {:#x} size {:#x} qmd[33] {:#x}:{}",
+                     program, qmd[20] & 0xff, address, bank.size.Value(), qmd[33], text);
+        }
+    }
     dlss_chain.output_pass = false;
     // Fortune's Weave's evaluation is 13 dispatches. Bound incomplete evaluations, including
     // skipped dispatches, so a missing output pass cannot keep the chain active indefinitely.
