@@ -2128,6 +2128,11 @@ private:
         }
         const u64 shown = (u64{layout.width} << 48) | (u64{layout.height} << 32) |
                           (u64{crop_width} << 16) | crop_height;
+        if (image_format != 1 && image_format != 4 && image_format != m_unknown_format) {
+            m_unknown_format = image_format;
+            LOG_WARNING(Service, "nx2:vi2 present: image {} has unknown format {}, shown as RGBA8",
+                        image_id, image_format);
+        }
         if (shown != m_shown_layout) {
             m_shown_layout = shown;
             LOG_INFO(Service,
@@ -2497,6 +2502,7 @@ private:
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
     u64 m_shown_layout{}; // image and crop size last logged
+    u32 m_unknown_format{1}; // last unknown present format logged
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
 
@@ -3739,8 +3745,13 @@ private:
         image.memory = w[19];
         std::copy_n(w + 2, image.preference.size(), image.preference.begin());
         image.size = Nx2CalculateImageLayout(w + 2).size;
-        LOG_INFO(Service, "nx2:gsv 429 CreateNativeImage memory={} count={} size={:#x} -> id {}",
-                 w[19], w[18], image.size, id);
+        LOG_INFO(Service,
+                 "nx2:gsv 429 CreateNativeImage memory={} count={} size={:#x} format={} -> id {} "
+                 "(preference {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x})",
+                 w[19], w[18], image.size, image.preference[6], id, image.preference[0],
+                 image.preference[1], image.preference[3], image.preference[7],
+                 image.preference[8], image.preference[9], image.preference[10],
+                 image.preference[11]);
         TipcReplyWords(ctx, {id});
     }
 
