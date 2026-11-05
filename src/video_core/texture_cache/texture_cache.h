@@ -2138,7 +2138,7 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
         static std::mutex trace_mutex;
         static std::set<std::pair<GPUVAddr, u32>> traced;
         std::scoped_lock trace_lock{trace_mutex};
-        if (traced.size() < 2000 && traced.emplace(config.Address(), config.raw[0] & 0xffffffffU).second) {
+        if (traced.size() < 2000 && traced.emplace(config.Address(), static_cast<u32>(config.raw[0])).second) {
             LOG_INFO(HW_GPU,
                      "TIC {:#x} {}x{}x{} type {} format {:#x} types {}/{}/{}/{} swizzle {}{}{}{} "
                      "header {} -> {} (raw {:016x} {:016x} {:016x} {:016x})",
