@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <set>
 #include <vector>
 #include <optional>
 #include <bit>
@@ -1926,6 +1928,27 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& raw_config) {
     }
     const TICEntry config = TextureViewHeader(raw_config, native);
     const ImageInfo info(config);
+    // EDEN_NX2_TIC_TRACE: log every distinct texture header once (format, component types,
+    // swizzle, size and the host format picked), to check how a game's textures are read.
+    if (static const bool tic_trace = std::getenv("EDEN_NX2_TIC_TRACE") != nullptr; tic_trace) {
+        static std::mutex trace_mutex;
+        static std::set<std::pair<GPUVAddr, u32>> traced;
+        std::scoped_lock trace_lock{trace_mutex};
+        if (traced.size() < 2000 && traced.emplace(config.Address(), config.raw[0] & 0xffffffffU).second) {
+            LOG_INFO(HW_GPU,
+                     "TIC {:#x} {}x{}x{} type {} format {:#x} types {}/{}/{}/{} swizzle {}{}{}{} "
+                     "header {} -> {} (raw {:016x} {:016x} {:016x} {:016x})",
+                     config.Address(), config.Width(), config.Height(), config.Depth(),
+                     static_cast<u32>(config.texture_type.Value()),
+                     static_cast<u32>(config.format.Value()), static_cast<u32>(config.r_type.Value()),
+                     static_cast<u32>(config.g_type.Value()), static_cast<u32>(config.b_type.Value()),
+                     static_cast<u32>(config.a_type.Value()), static_cast<u32>(config.x_source.Value()),
+                     static_cast<u32>(config.y_source.Value()), static_cast<u32>(config.z_source.Value()),
+                     static_cast<u32>(config.w_source.Value()),
+                     static_cast<u32>(config.header_version.Value()), info.format, config.raw[0],
+                     config.raw[1], config.raw[2], config.raw[3]);
+        }
+    }
     if (info.type == ImageType::Buffer) {
         const ImageViewInfo view_info(config, 0);
         return slot_image_views.insert(runtime, info, view_info, config.Address());
