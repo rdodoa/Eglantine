@@ -8,12 +8,15 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <type_traits>
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/kernel_helpers.h"
 
@@ -2507,6 +2510,7 @@ void Call(Core::System& system, u32 imm) {
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
     GetCurrentThread(kernel).SetEnteredKernel();
     //kernel.EnterSVCProfile();
+    const std::array<uint64_t, 8> in_args = args;
     LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
         imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
         GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
@@ -2573,6 +2577,24 @@ void Call(Core::System& system, u32 imm) {
         Call64(system, imm, args);
     } else {
         Call32(system, imm, args);
+    }
+    if (process.IsSwitch2()) {
+        // Many SVCs reject bad arguments without logging, and Switch 2 SDKs abort on the result
+        // (Ocarina of Time panics with 2001-0120). Report each SVC/result pair once.
+        const u32 raw = static_cast<u32>(args[0]);
+        if (raw != ResultSuccess.raw && raw != ResultTimedOut.raw && raw != ResultCancelled.raw &&
+            raw != ResultTerminationRequested.raw) {
+            static std::mutex failed_mutex;
+            static std::set<std::pair<u32, u32>> failed;
+            std::scoped_lock lk{failed_mutex};
+            if (failed.emplace(imm, raw).second) {
+                LOG_WARNING(Kernel_SVC,
+                            "Switch 2 svc {:#04x} failed with {:#x} ({:04}-{:04}) [0]={:#x} [1]={:#x} "
+                            "[2]={:#x} [3]={:#x} in: [1]={:#x} [2]={:#x} [3]={:#x}",
+                            imm, raw, 2000 + (raw & 0x1FF), (raw >> 9) & 0x1FFF, args[0], args[1],
+                            args[2], args[3], in_args[1], in_args[2], in_args[3]);
+            }
+        }
     }
     if (svc_trace) {
         LOG_INFO(Kernel_SVC, "svc {:#04x} out t{} [0]={:#x} [1]={:#x} [2]={:#x}", imm,
