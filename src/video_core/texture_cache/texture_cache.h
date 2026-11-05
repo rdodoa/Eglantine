@@ -293,6 +293,10 @@ void TextureCache<P>::TickFrame() {
                 const u64 size = *end == ':' ? std::strtoull(end + 1, &end, 16) : 0;
                 position = tex_dump.find(',', position + 1);
                 std::vector<u8> bytes(size);
+                // Images the GPU wrote are downloaded first, so the bytes are the current ones.
+                if (const auto cpu_address = gpu_memory->GpuToCpuAddress(address)) {
+                    DownloadMemory(*cpu_address, size);
+                }
                 gpu_memory->ReadBlockUnsafe(address, bytes.data(), bytes.size());
                 const std::string path =
                     fmt::format("{}/nx2-tex-{:x}.bin", directory ? directory : ".", address);
