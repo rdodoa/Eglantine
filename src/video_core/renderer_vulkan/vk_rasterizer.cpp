@@ -766,6 +766,55 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
     }
+    // EDEN_NX2_DRAW_TRACE=<pixel program address>: for the first draws with that pixel program, log
+    // its blend and write-mask state, the blend constant, the vertex attribute formats and the
+    // pixel stage's constant bank 7 (to find where a channel is lost between a texture and a target).
+    if (static const u64 draw_trace = [] {
+            const char* value = std::getenv("EDEN_NX2_DRAW_TRACE");
+            return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        draw_trace != 0) {
+        const auto& regs = maxwell3d->regs;
+        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        static u32 traced_draws{};
+        if (ps == draw_trace && traced_draws < 4) {
+            ++traced_draws;
+            const auto& bt = regs.blend_per_target[0];
+            LOG_INFO(HW_GPU,
+                     "draw trace ps {:#x}: rt0 {:#x} format {:#x} mask {:#x} blend {} per-target {} "
+                     "global op {} src {:#x} dst {:#x} alpha op {} {:#x}/{:#x} | rt0 op {} src {:#x} "
+                     "dst {:#x} alpha op {} {:#x}/{:#x} | constant {} {} {} {}",
+                     ps, regs.rt[0].Address(), static_cast<u32>(regs.rt[0].format),
+                     regs.color_mask[0].raw, regs.blend.enable[0], regs.blend_per_target_enabled,
+                     static_cast<u32>(regs.blend.color_op), static_cast<u32>(regs.blend.color_source),
+                     static_cast<u32>(regs.blend.color_dest), static_cast<u32>(regs.blend.alpha_op),
+                     static_cast<u32>(regs.blend.alpha_source), static_cast<u32>(regs.blend.alpha_dest),
+                     static_cast<u32>(bt.color_op), static_cast<u32>(bt.color_source),
+                     static_cast<u32>(bt.color_dest), static_cast<u32>(bt.alpha_op),
+                     static_cast<u32>(bt.alpha_source), static_cast<u32>(bt.alpha_dest),
+                     regs.blend_color.r, regs.blend_color.g, regs.blend_color.b, regs.blend_color.a);
+            std::string attributes;
+            for (u32 i = 0; i < 8; ++i) {
+                const auto& attribute = regs.vertex_attrib_format[i];
+                attributes += fmt::format(" [{}] {:08x} (buf {} off {} size {:#x} type {} const {} bgra {})",
+                                          i, attribute.hex, attribute.buffer.Value(), attribute.offset.Value(),
+                                          static_cast<u32>(attribute.size.Value()),
+                                          static_cast<u32>(attribute.type.Value()),
+                                          attribute.constant.Value(), attribute.bgra.Value());
+            }
+            LOG_INFO(HW_GPU, "draw trace attributes:{}", attributes);
+            const auto& bank = maxwell3d->state.shader_stages[4].const_buffers[7];
+            if (bank.enabled) {
+                std::array<u32, 12> words{};
+                gpu_memory->ReadBlockUnsafe(bank.address, words.data(), sizeof(words));
+                std::string text;
+                for (const u32 word : words) {
+                    text += fmt::format(" {:08x}({})", word, std::bit_cast<f32>(word));
+                }
+                LOG_INFO(HW_GPU, "draw trace fs c7 {:#x}:{}", bank.address, text);
+            }
+        }
+    }
     // EDEN_NX2_RT_TRACE: log the first draw to every distinct colour target (debug aid).
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {
         static std::set<std::tuple<GPUVAddr, u32, u32, u64, u64>> seen;
