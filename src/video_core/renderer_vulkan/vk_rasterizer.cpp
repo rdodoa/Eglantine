@@ -776,9 +776,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         draw_trace != 0) {
         const auto& regs = maxwell3d->regs;
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        static u32 traced_draws{};
-        if (ps == draw_trace && traced_draws < 4) {
-            ++traced_draws;
+        // The value names a pixel program, or a colour target: then each distinct pixel program
+        // drawing into that target is traced once.
+        static std::set<u64> traced_programs;
+        const bool target_match = regs.rt[0].Address() == draw_trace;
+        if ((ps == draw_trace || target_match) && traced_programs.size() < 48 &&
+            traced_programs.insert(ps).second) {
             const auto& bt = regs.blend_per_target[0];
             LOG_INFO(HW_GPU,
                      "draw trace ps {:#x}: rt0 {:#x} format {:#x} mask {:#x} blend {} per-target {} "
@@ -812,6 +815,22 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                     text += fmt::format(" {:08x}({})", word, std::bit_cast<f32>(word));
                 }
                 LOG_INFO(HW_GPU, "draw trace fs c7 {:#x}:{}", bank.address, text);
+            }
+            // Fragment texture handles (bound bank 2) and the images they name.
+            const auto& handles = maxwell3d->state.shader_stages[4].const_buffers[2];
+            if (handles.enabled) {
+                for (u32 i = 0; i < 12; ++i) {
+                    const u32 handle = gpu_memory->Read<u32>(handles.address + 0x60 + i * 4);
+                    if (handle == 0 || handle == 0xffffffff) continue;
+                    Tegra::Texture::TICEntry tic{};
+                    gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
+                                                &tic, sizeof(tic));
+                    LOG_INFO(HW_GPU, "draw trace fs handle c2[{:#x}] = {:#x}: {:#x} {}x{} format {:#x} swizzle {}{}{}{}",
+                             0x60 + i * 4, handle, tic.Address(), tic.Width(), tic.Height(),
+                             static_cast<u32>(tic.format.Value()), static_cast<u32>(tic.x_source.Value()),
+                             static_cast<u32>(tic.y_source.Value()), static_cast<u32>(tic.z_source.Value()),
+                             static_cast<u32>(tic.w_source.Value()));
+                }
             }
         }
     }
