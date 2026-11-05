@@ -13,6 +13,8 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <cstdio>
+#include <string>
 #include <vector>
 #include <optional>
 #include <bit>
@@ -282,6 +284,35 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
 
 template <class P>
 void TextureCache<P>::TickFrame() {
+    // EDEN_NX2_TEXDUMP=<frame>:<gpu address>:<size>[,<gpu address>:<size>...]: at that frame,
+    // save the guest bytes at those GPU addresses as nx2-tex-<address>.bin in the
+    // EDEN_NX2_FRAME_CAPTURE directory (textures the CPU writes, e.g. a movie's planes).
+    if (static const std::string tex_dump = [] {
+            const char* text = std::getenv("EDEN_NX2_TEXDUMP");
+            return text ? std::string{text} : std::string{};
+        }();
+        !tex_dump.empty() && gpu_memory != nullptr) {
+        static u64 frames{};
+        if (++frames == std::strtoull(tex_dump.c_str(), nullptr, 10)) {
+            const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
+            size_t position = tex_dump.find(':');
+            while (position != std::string::npos) {
+                char* end{};
+                const GPUVAddr address = std::strtoull(tex_dump.c_str() + position + 1, &end, 16);
+                const u64 size = *end == ':' ? std::strtoull(end + 1, &end, 16) : 0;
+                position = tex_dump.find(',', position + 1);
+                std::vector<u8> bytes(size);
+                gpu_memory->ReadBlockUnsafe(address, bytes.data(), bytes.size());
+                const std::string path =
+                    fmt::format("{}/nx2-tex-{:x}.bin", directory ? directory : ".", address);
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(bytes.data(), 1, bytes.size(), file);
+                    std::fclose(file);
+                }
+                LOG_INFO(HW_GPU, "nx2: texture dump {:#x} bytes at {:#x} to {}", size, address, path);
+            }
+        }
+    }
     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
     // rather than kept for the rest of the session.
     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
