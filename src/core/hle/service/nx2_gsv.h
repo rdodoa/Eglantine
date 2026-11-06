@@ -3197,6 +3197,37 @@ private:
         const u32 bpp = layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ? 1 : 4;
         const u32 w = width / 4;
         const u32 h = height / 4;
+        if (bpp == 1) {
+            // NV12: also save the colours (BT.709, limited range) and log the mean U and V, to
+            // tell a decoder problem from a sampling problem when a movie shows wrong colours.
+            u64 sum_u{}, sum_v{}, samples{};
+            const std::string color_path = fmt::format("{}/nx2-vdec-image-{}-{:05}.ppm", directory,
+                                                       image_id, m_frames_out + 1);
+            std::FILE* color = std::fopen(color_path.c_str(), "wb");
+            if (color) std::fprintf(color, "P6 %u %u 255\n", w, h);
+            for (u32 y = 0; y < h; ++y) {
+                for (u32 x = 0; x < w; ++x) {
+                    const float luma = bytes[y * 4 * layout.pitch + x * 4];
+                    const u64 chroma = layout.chroma_offset + y * 2 * layout.pitch + x * 4;
+                    const float u = bytes[chroma], v = bytes[chroma + 1];
+                    sum_u += bytes[chroma];
+                    sum_v += bytes[chroma + 1];
+                    ++samples;
+                    const float l = (luma - 16.0f) * 1.164384f;
+                    const auto clamp = [](float value) {
+                        return static_cast<u8>(std::clamp(value, 0.0f, 255.0f));
+                    };
+                    const u8 rgb[3]{clamp(l + 1.792741f * (v - 128.0f)),
+                                    clamp(l - 0.213249f * (u - 128.0f) - 0.532909f * (v - 128.0f)),
+                                    clamp(l + 2.112402f * (u - 128.0f))};
+                    if (color) std::fwrite(rgb, 1, 3, color);
+                }
+            }
+            if (color) std::fclose(color);
+            LOG_INFO(Service, "nx2:vdec frame {} {}x{} pitch {} chroma at {:#x}: mean U {} V {}",
+                     m_frames_out + 1, width, height, layout.pitch, layout.chroma_offset,
+                     samples ? sum_u / samples : 0, samples ? sum_v / samples : 0);
+        }
         const std::string path =
             fmt::format("{}/nx2-vdec-image-{}-{:05}.pgm", directory, image_id, m_frames_out + 1);
         if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
