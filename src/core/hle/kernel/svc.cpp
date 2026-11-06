@@ -2580,16 +2580,19 @@ void Call(Core::System& system, u32 imm) {
     } else {
         Call32(system, imm, args);
     }
-    // ExitProcess, ExitThread, SleepThread, GetCurrentProcessorNumber, GetSystemTick, Break,
-    // FlushEntireDataCache, FlushDataCache and SynchronizePreemptionState return no Result.
-    constexpr std::array<u32, 9> NoResultSvcs{0x07, 0x0a, 0x0b, 0x10, 0x1e, 0x26, 0x2a, 0x2b, 0x36};
+    // ExitProcess, ExitThread, SleepThread, GetCurrentProcessorNumber, SignalProcessWideKey,
+    // GetSystemTick, Break, FlushEntireDataCache, FlushDataCache and SynchronizePreemptionState
+    // return no Result.
+    constexpr std::array<u32, 10> NoResultSvcs{0x07, 0x0a, 0x0b, 0x10, 0x1d, 0x1e, 0x26, 0x2a, 0x2b, 0x36};
     if (process.IsSwitch2() &&
         std::find(NoResultSvcs.begin(), NoResultSvcs.end(), imm) == NoResultSvcs.end()) {
         // Many SVCs reject bad arguments without logging, and Switch 2 SDKs abort on the result
         // (Ocarina of Time panics with 2001-0120). Report each SVC/result pair once.
         const u32 raw = static_cast<u32>(args[0]);
+        // InvalidState from the address arbiter only means the value changed before the wait.
+        const bool arbiter_retry = (imm == 0x34 || imm == 0x35) && raw == ResultInvalidState.raw;
         if (raw != ResultSuccess.raw && raw != ResultTimedOut.raw && raw != ResultCancelled.raw &&
-            raw != ResultTerminationRequested.raw) {
+            raw != ResultTerminationRequested.raw && !arbiter_retry) {
             static std::mutex failed_mutex;
             static std::set<std::pair<u32, u32>> failed;
             std::scoped_lock lk{failed_mutex};
