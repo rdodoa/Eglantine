@@ -819,14 +819,15 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             // Fragment texture handles (bound bank 2) and the images they name.
             const auto& handles = maxwell3d->state.shader_stages[4].const_buffers[2];
             if (handles.enabled) {
-                for (u32 i = 0; i < 12; ++i) {
-                    const u32 handle = gpu_memory->Read<u32>(handles.address + 0x60 + i * 4);
+                for (u32 i = 0; i < 40; ++i) {
+                    const u32 handle = gpu_memory->Read<u32>(handles.address + i * 4);
+                    if (handle == 0x10200102) continue; // the 4x4 placeholder bound to unused slots
                     if (handle == 0 || handle == 0xffffffff) continue;
                     Tegra::Texture::TICEntry tic{};
                     gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
                                                 &tic, sizeof(tic));
                     LOG_INFO(HW_GPU, "draw trace fs handle c2[{:#x}] = {:#x}: {:#x} {}x{} format {:#x} swizzle {}{}{}{}",
-                             0x60 + i * 4, handle, tic.Address(), tic.Width(), tic.Height(),
+                             i * 4, handle, tic.Address(), tic.Width(), tic.Height(),
                              static_cast<u32>(tic.format.Value()), static_cast<u32>(tic.x_source.Value()),
                              static_cast<u32>(tic.y_source.Value()), static_cast<u32>(tic.z_source.Value()),
                              static_cast<u32>(tic.w_source.Value()));

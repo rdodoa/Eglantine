@@ -568,6 +568,18 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             }
             LOG_INFO(HW_GPU, "Native compute {:#x}: banks {:#x} cbuf0 {:#x} size {:#x} qmd[33] {:#x}:{}",
                      program, qmd[20] & 0xff, address, bank.size.Value(), qmd[33], text);
+            // Words 0x50-0x7c are where these programs keep their texture/surface handles.
+            for (u32 offset = 0x50; offset < 0x80; offset += 4) {
+                const u32 handle = words[offset / 4];
+                const u32 tic_index = handle & 0xfffff;
+                if (handle == 0 || tic_index > regs.tic.limit) continue;
+                const auto tic = GetTICEntry(tic_index);
+                LOG_INFO(HW_GPU, "  handle @{:#x} = {:#x}: tic {:#x} address {:#x} {}x{} format {:#x} swizzle {}{}{}{}",
+                         offset, handle, tic_index, tic.Address(), tic.Width(), tic.Height(),
+                         static_cast<u32>(tic.format.Value()), static_cast<u32>(tic.x_source.Value()),
+                         static_cast<u32>(tic.y_source.Value()), static_cast<u32>(tic.z_source.Value()),
+                         static_cast<u32>(tic.w_source.Value()));
+            }
         }
     }
     dlss_chain.output_pass = false;
