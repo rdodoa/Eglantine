@@ -1821,7 +1821,11 @@ private:
         const auto waited = std::chrono::steady_clock::now();
         Composite(w[5], ~w[22], w[24], w[7]);
         const auto composited = std::chrono::steady_clock::now();
-        PaceToVblank(w[12], ctx.GetThread().GetOwnerProcess());
+        // The loader patched the application process; the caller's process need not be it
+        // (from SmileyTatsu/Eglantine 0cd801d8b9, so mkw_dynamic_fps applies).
+        const Kernel::KProcess* const application = system.ApplicationProcess();
+        PaceToVblank(w[12], application != nullptr ? application
+                                                   : ctx.GetThread().GetOwnerProcess());
         const auto paced = std::chrono::steady_clock::now();
         if (Common::DkbFrameTrace::Enabled()) {
             const auto ms = [](auto duration) {
