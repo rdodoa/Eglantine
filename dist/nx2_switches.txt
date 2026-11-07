@@ -56,8 +56,9 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_DRAW_EMPTY=1
 # Eglantine-DKB (DK Bananza only): macro DMA reads of untouched pages skip the full drain
 #EDEN_NX2_DMA_DRAIN=1
-# Opt-in: skip small Switch 2 draws while their pipeline builds (less stutter, maybe missing effects)
-#EDEN_NX2_ASYNC_SKIP=1
+# Skip Switch 2 draws while their pipeline builds instead of stopping the game to wait for it (with
+# asynchronous shaders on; an effect can be missing for a moment). =0 waits for every build.
+EDEN_NX2_ASYNC_SKIP=1
 # Selevet: the timer thread sleeps through long waits (frees most of a CPU core on 6-core CPUs)
 #EDEN_TIMING_COARSE=0
 # Selevet: wake the timer thread only for a new earliest event (Donkey Kong Bananza)
