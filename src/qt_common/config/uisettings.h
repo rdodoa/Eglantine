@@ -61,17 +61,13 @@ enum class Theme {
     DarkColorful,
     MidnightBlue,
     MidnightBlueColorful,
+    Hortensia,
 };
 
-static constexpr Theme default_theme{
-#ifdef _WIN32
-    Theme::DarkColorful
-#else
-    Theme::DefaultColorful
-#endif
-};
+// Hortensia's own dark theme (pink and orchid) everywhere.
+static constexpr Theme default_theme{Theme::Hortensia};
 
-using Themes = std::array<std::pair<const char*, const char*>, 6>;
+using Themes = std::array<std::pair<const char*, const char*>, 7>;
 extern const Themes themes;
 
 struct GameDir {
@@ -211,7 +207,7 @@ struct Values {
     Setting<u32, true> game_icon_size{linkage, 64, 0, 512, "game_icon_size", Category::UiGameList};
     Setting<u32, true> folder_icon_size{linkage, 48, 8, 512, "folder_icon_size", Category::UiGameList};
     Setting<u8> row_1_text_id{linkage, 3, "row_1_text_id", Category::UiGameList};
-    Setting<u8> row_2_text_id{linkage, 2, "row_2_text_id", Category::UiGameList};
+    Setting<u8> row_2_text_id{linkage, 1, "row_2_text_id", Category::UiGameList};
     Setting<Settings::GameListMode> game_list_mode{linkage, Settings::GameListMode::TreeView, "game_list_mode", Category::UiGameList};
     Setting<bool> show_game_name{linkage, true, "show_game_name", Category::UiGameList};
 
@@ -247,7 +243,7 @@ void SaveWindowState();
 void RestoreWindowState(std::unique_ptr<QtConfig>& qtConfig);
 
 // sync with uisettings.cpp
-extern const std::array<Shortcut, 32> default_hotkeys;
+extern const std::array<Shortcut, 33> default_hotkeys;
 
 } // namespace UISettings
 

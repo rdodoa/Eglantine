@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -84,7 +85,27 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
                     paused_set = false;
                     if (auto const next_time = Advance(); next_time) {
                         // There are more events left in the queue, wait until the next event.
-                        auto const wait_time = *next_time - GetGlobalTimeNs().count();
+                        auto wait_time = *next_time - GetGlobalTimeNs().count();
+                        // Event::WaitFor waits with MWAITX/UMWAIT on Windows: precise, but the
+                        // thread keeps its logical CPU for the whole wait (91% of a core in Mario
+                        // Kart World), CPU the game's cores could use on a 6-core machine. Sleep
+                        // through the bulk of a long wait instead and spin only for its last
+                        // CoarseMargin. EDEN_TIMING_COARSE=0 waits precisely all the way.
+                        // From Selevet.
+                        static const bool coarse = [] {
+                            const char* value = std::getenv("EDEN_TIMING_COARSE");
+                            return value == nullptr || value[0] != '0';
+                        }();
+                        constexpr s64 CoarseMargin = 1'500'000; // ns: the OS sleep's lateness
+                        if (coarse && wait_time > CoarseMargin + 500'000) {
+                            const auto until = std::chrono::steady_clock::now() +
+                                               std::chrono::nanoseconds(wait_time - CoarseMargin);
+                            if (!event.WaitUntil(until)) {
+                                wait_time = *next_time - GetGlobalTimeNs().count();
+                            } else {
+                                wait_time = 0; // Signalled: a new event; recompute it.
+                            }
+                        }
                         if (wait_time > 0) {
                             event.WaitFor(std::chrono::nanoseconds(wait_time));
                         }
@@ -149,15 +170,26 @@ bool CoreTiming::HasPendingEvents() const {
 
 void CoreTiming::ScheduleEvent(std::chrono::nanoseconds ns_into_future,
                                const std::shared_ptr<EventType>& event_type, bool absolute_time) {
+    bool earliest;
     {
         std::scoped_lock scope{basic_lock};
         const auto next_time{absolute_time ? ns_into_future : GetGlobalTimeNs() + ns_into_future};
 
-        auto h{event_queue.emplace(Event{next_time.count(), event_fifo_id++, event_type, 0})};
+        const u64 fifo = event_fifo_id++;
+        auto h{event_queue.emplace(Event{next_time.count(), fifo, event_type, 0})};
         (*h).handle = h;
+        earliest = event_queue.top().fifo_order == fifo;
     }
 
-    event.Set();
+    // The timer thread waits for the earliest event: wake it only when this one comes first.
+    // Guest kernel timers are rescheduled for every sleep with a timeout, tens of thousands of
+    // times a second in Donkey Kong Bananza, and each wake-up also took the locks the guest
+    // cores schedule with. EDEN_TIMING_WAKE_ALL=1 wakes it for every event as before.
+    // From Selevet.
+    static const bool wake_all = std::getenv("EDEN_TIMING_WAKE_ALL") != nullptr;
+    if (earliest || wake_all) {
+        event.Set();
+    }
 }
 
 void CoreTiming::ScheduleLoopingEvent(std::chrono::nanoseconds start_time,

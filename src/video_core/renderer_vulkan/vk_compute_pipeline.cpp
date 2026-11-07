@@ -28,6 +28,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/renderer_vulkan/pipeline_compile_log.h"
 #include "common/logging.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
@@ -288,6 +289,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
             .basePipelineIndex = 0,
         };
         try {
+            const PipelineCompileLog compile_log{"compute", fmt::format("s6:{:016x}", shader_hash)};
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,

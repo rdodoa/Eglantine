@@ -4,10 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <ranges>
 #include "common/settings.h"
+#include "video_core/renderer_vulkan/vk_gpu_breadcrumbs.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -103,13 +106,43 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
+    // Titles that read GPU-written command lists wait here over a thousand times a second, for work
+    // that often ends within microseconds, and a sleep in the driver wakes up late. Poll first.
+    // EDEN_NX2_GPU_WAIT_SPIN_US=<microseconds> sets how long; 0 goes straight to the driver.
+    // From sylvieistaken/selevet-eglantine.
+    static const auto spin = std::chrono::microseconds{[] {
+        const char* value = std::getenv("EDEN_NX2_GPU_WAIT_SPIN_US");
+        return value != nullptr ? std::atoi(value) : 300;
+    }()};
+    if (spin.count() > 0) {
+        const auto end = std::chrono::steady_clock::now() + spin;
+        do {
+            std::this_thread::yield();
+            Refresh();
+            if (IsFree(tick)) {
+                return;
+            }
+        } while (std::chrono::steady_clock::now() < end);
+    }
+
     // If none of the above is hit, fallback to a regular wait
     try {
-        while (!semaphore.Wait(tick)) {
+        // A healthy GPU passes any tick within a frame or two; after 2 s say what it was doing
+        // (a hang often ends in a driver reset that later surfaces as an unrelated failure).
+        bool reported = false;
+        while (!semaphore.Wait(tick,
+                               reported ? (std::numeric_limits<u64>::max)() : u64{2'000'000'000})) {
+            if (!reported) {
+                reported = true;
+                LOG_CRITICAL(Render_Vulkan, "GPU has not reached tick {} after 2 s (at {})", tick,
+                             semaphore.GetCounter());
+                GpuBreadcrumbs::Get().Dump("GPU wait over 2 s");
+            }
         }
     } catch (const vk::Exception& exception) {
         // The throw ends the process; say why first (a device loss reached nothing else here).
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
+        GpuBreadcrumbs::Get().Dump("GPU wait failed");
         throw;
     }
 

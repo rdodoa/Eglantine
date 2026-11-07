@@ -40,7 +40,12 @@ typedef struct Emulator {
             Common::FS::enumName##CacheDir                                                         \
     }
 
-static constexpr std::array<Emulator, 4> legacy_emus = {
+static constexpr std::array<Emulator, 8> legacy_emus = {
+    // Hortensia: the Switch 2 builds people come from (Eglantine and Eden share "eden").
+    STRUCT_EMU(QT_TR_NOOP("Bouquet"), Bouquet),
+    STRUCT_EMU(QT_TR_NOOP("Lichii"), Lichii),
+    STRUCT_EMU(QT_TR_NOOP("Eden / Eglantine / Selevet"), EdenLegacy),
+    STRUCT_EMU(QT_TR_NOOP("Eglantine (new folder)"), Eglantine),
     STRUCT_EMU(QT_TR_NOOP("Citron"), Citron),
     STRUCT_EMU(QT_TR_NOOP("Sudachi"), Sudachi),
     STRUCT_EMU(QT_TR_NOOP("Suyu"), Suyu),

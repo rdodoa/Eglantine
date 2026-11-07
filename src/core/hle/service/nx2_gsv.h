@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/hle/service/nx2_gsv_server.h"
 #include "common/alignment.h"
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
@@ -93,10 +94,12 @@ inline Kernel::KClientSession* CreateRawSession(Core::System& system, HLERequest
     session->Initialize(kernel, nullptr, 0);
     Kernel::KSession::Register(kernel, session);
 
-    auto manager =
-        std::make_shared<SessionRequestManager>(kernel, ctx.GetManager()->GetServerManager());
+    // On the graphics system's own host thread when it runs (nx2_gsv_server.h).
+    ServerManager* const gsv_server = g_nx2_gsv_server.load(std::memory_order_acquire);
+    ServerManager& server = gsv_server != nullptr ? *gsv_server : ctx.GetManager()->GetServerManager();
+    auto manager = std::make_shared<SessionRequestManager>(kernel, server);
     manager->SetSessionHandler(std::move(iface));
-    ctx.GetManager()->GetServerManager().RegisterSession(&session->GetServerSession(), manager);
+    server.RegisterSession(&session->GetServerSession(), manager);
     return &session->GetClientSession();
 }
 
@@ -1884,6 +1887,8 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     Nx2PresentPacer m_present_pacer;
     u32 m_swap_word{};
+    u32 m_swap_stable{};  ///< Presents since the swap word last changed (capped)
+    u32 m_swap_changes{}; ///< Logged swap word changes (the first 32)
 
     struct FrameTrace {
         Common::DkbFrameTrace::RateLimit rate;
@@ -1919,8 +1924,35 @@ private:
         const bool mkw_dynamic =
             process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId &&
             process->IsMkwDynamicFpsPatchApplied() && Settings::values.mkw_dynamic_fps.GetValue();
-        u32 swap_interval = std::clamp<u32>(timing >> 16, 1, 4);
+        // EDEN_NX2_SWAP_STABLE=<presents> (from Orchid, after Selevet): honour an interval above 1
+        // only once the game has kept it that long. Mario Kart World flips between 1 and 2 every
+        // few frames (its own timing on a VRR display); held to two vblanks on each 2 it fell from
+        // ~40 to 20-30 fps for Selevet. Mario Kart World waits 120 presents by default, as in
+        // Selevet; other titles honour every interval at once unless the switch is set.
+        static const char* const stable_env = std::getenv("EDEN_NX2_SWAP_STABLE");
+        const u32 stable_presents =
+            stable_env != nullptr ? static_cast<u32>(std::strtoul(stable_env, nullptr, 10))
+            : (process != nullptr && process->GetProgramId() == Settings::MarioKartWorldProgramId)
+                ? 120U
+                : 0U;
+        const bool changed = timing != std::exchange(m_swap_word, timing);
+        if (changed) {
+            m_swap_stable = 0;
+        } else if (m_swap_stable < stable_presents) {
+            ++m_swap_stable;
+        }
+        u32 swap_interval =
+            m_swap_stable >= stable_presents ? std::clamp<u32>(timing >> 16, 1, 4) : 1U;
         if (mkw_dynamic) {
+            swap_interval = 1;
+        }
+        // Bananza with dynamic FPS (loader/nso.cpp) times its own frames: holding each frame for
+        // the 2 or 3 vblanks it asked for kept it at 20-30 fps. Pace it to every vblank instead
+        // (from ZendNevs's fork). EDEN_NX2_PACE_ONE=0 keeps the interval it asks for.
+        static const char* const pace_one_env = std::getenv("EDEN_NX2_PACE_ONE");
+        if (process != nullptr && process->GetProgramId() == 0x040074A01BF12000ULL &&
+            Settings::values.dk_dynamic_fps.GetValue() &&
+            !(pace_one_env != nullptr && pace_one_env[0] == '0')) {
             swap_interval = 1;
         }
         if (forced_interval != 0) {
@@ -1935,7 +1967,9 @@ private:
         if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
             return;
         }
-        if (timing != std::exchange(m_swap_word, timing)) {
+        // The first 32 changes: a title that flips its interval every few frames filled the log.
+        if (changed && m_swap_changes < 32) {
+            ++m_swap_changes;
             LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
                      m_presents, swap_interval, refresh_rate, timing);
         }
@@ -3044,8 +3078,11 @@ private:
             }
             if (input.end) {
                 // The client stops at the frame marked end of stream; give it one even when the
-                // last input held no picture.
-                if (m_decoded.empty()) {
+                // last input held no picture. Only a picture from this input may carry the mark:
+                // marking an earlier one still waiting for an image hands out one frame fewer
+                // than the client counts, and its next 213 finds the ring empty (0x1c286f), which
+                // Mario Kart World panics on as a video ends (fix from selevet-eglantine).
+                if (pictures.empty()) {
                     m_decoded.push_back({std::nullopt, input.pts, true});
                 } else {
                     m_decoded.back().end = true;
@@ -3163,9 +3200,11 @@ private:
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
                                            layout.height, 1, 4, 0, 1, true);
             memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
+            // preserve_gpu_writes: GPU-written bytes on these pages are handled on the GPU thread
+            // (as CPU writes through core/memory.cpp are), never from this service thread.
             if (const auto device =
                     Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
-                system.GPU().InvalidateRegion(*device, m_tiled.size());
+                system.GPU().InvalidateRegion(*device, m_tiled.size(), true);
             }
             trace_write();
             return {width, height};
@@ -3179,8 +3218,9 @@ private:
                               layout.pitch * ((height + 1) / 2));
         }
         // The game samples the image on the GPU: drop the texture cache's copy of the old frame.
+        // preserve_gpu_writes: GPU-written bytes on these pages are handled on the GPU thread.
         if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
-            system.GPU().InvalidateRegion(*device, layout.size);
+            system.GPU().InvalidateRegion(*device, layout.size, true);
         }
         trace_write();
         return {width, height};

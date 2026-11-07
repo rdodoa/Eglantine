@@ -104,6 +104,9 @@ struct Profile {
     /// Some drivers have broken support for OpVectorExtractDynamic on subgroup mask inputs
     bool has_broken_spirv_subgroup_mask_vector_extract_dynamic{};
     bool has_broken_spirv_subgroup_shuffle{};
+    /// AMD graphics workaround, enabled only when this stage is forced to subgroup size 32.
+    /// Compute must keep Shuffle: the broadcast loop can hang AMDVLK pipeline compilation.
+    bool has_broken_spirv_dynamic_subgroup_shuffle{};
     bool has_broken_spirv_fragment_shuffle{};
     u32 max_subgroup_size{};
 

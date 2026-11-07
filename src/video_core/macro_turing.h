@@ -80,7 +80,7 @@ public:
     Result Execute(std::span<const Word> code, Word start,
                    std::vector<Word>& parameters, Read read, Emit emit) {
         std::array<Word, 24> regs{};
-        Word initialized{}, carry{}, method{}, increment{};
+        Word carry{}, method{}, increment{};
         Word pc = start, loop_count{}, loop_start{}, loop_end{};
         std::size_t consumed{};
         bool end_next{}, stopped{};
@@ -110,7 +110,8 @@ public:
             // operands are read up front. Carry chaining remains explicit between the lanes.
             const auto get = [&](Word reg, Word lane) -> Word {
                 if (reg < 24) {
-                    if (!(initialized & (1U << reg))) fail("uninitialized register read");
+                    // Registers start at zero, as in the x86-64 JIT (TuringMacroJit); stopping the
+                    // macro here dropped the draws it set up.
                     return regs[reg];
                 }
                 switch (reg) {
@@ -218,7 +219,7 @@ public:
                     break;
                 }
                 alu[lane] = value;
-                if (d.dst[lane] < 24) { regs[d.dst[lane]] = value; initialized |= 1U << d.dst[lane]; }
+                if (d.dst[lane] < 24) { regs[d.dst[lane]] = value; }
                 else if (d.dst[lane] != 24) fail("invalid destination register");
             }
             const auto output = [&](Word selector) -> Word {

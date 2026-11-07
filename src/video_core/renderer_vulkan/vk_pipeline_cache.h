@@ -180,6 +180,8 @@ private:
     bool use_vulkan_pipeline_cache{};
     const size_t num_pipeline_workers;
     EmissionBudget emission_budget;
+    bool oot_visual_workaround{};
+    u64 visual_workaround_title{};
 
     GraphicsPipelineCacheKey graphics_key{};
     GraphicsPipeline* current_pipeline{};

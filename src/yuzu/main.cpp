@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <cstdlib>
+#include <chrono>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -35,6 +37,7 @@
 
 #ifdef _WIN32
 #include <QScreen>
+#include <windows.h>
 
 static void OverrideWindowsFont() {
     // Qt5 chooses these fonts on Windows and they have fairly ugly alphanumeric/cyrillic characters
@@ -161,8 +164,40 @@ static void LoadNx2Switches(const char* argv0) {
     }
 }
 
+#ifdef HORTENSIA_PGO_GENERATE
+// PGO training build: write the profile next to hortensia.exe every 30 seconds, so a crash or a
+// forced close keeps what was played. Each process overwrites its own file with its counters so
+// far; tools/pgo/merge-profile.bat merges every session into hortensia.profdata.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_set_filename(const char*);
+static void StartProfileWriter(const char* argv0) {
+    static std::string pattern;
+    std::error_code error;
+    const auto dir = std::filesystem::absolute(argv0, error).parent_path() / "pgo";
+    std::filesystem::create_directories(dir, error);
+    pattern = (dir / "hortensia-%p.profraw").string();
+    __llvm_profile_set_filename(pattern.c_str());
+    std::thread{[] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds{30});
+            __llvm_profile_write_file();
+        }
+    }}.detach();
+}
+#endif
+
 int main(int argc, char* argv[]) {
     LoadNx2Switches(argv[0]);
+#ifdef HORTENSIA_PGO_GENERATE
+    StartProfileWriter(argv[0]);
+#endif
+#ifdef _WIN32
+    // Runs the process at high priority (from selevet-eglantine). EDEN_NX2_HIGH_PRIORITY=0 keeps
+    // it at normal.
+    if (const char* value = std::getenv("EDEN_NX2_HIGH_PRIORITY"); value == nullptr || value[0] != '0') {
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    }
+#endif
 #if YUZU_ROOM
     bool launch_room = false;
     for (int i = 1; i < argc; i++) {
@@ -194,7 +229,7 @@ int main(int argc, char* argv[]) {
 
     // Init settings params
     QCoreApplication::setOrganizationName(QStringLiteral("eden"));
-    QCoreApplication::setApplicationName(QStringLiteral("Lichii"));
+    QCoreApplication::setApplicationName(QStringLiteral("Hortensia"));
 
     // Increases the maximum open file limit.
     // TODO: This should be common to all frontends.
@@ -246,7 +281,7 @@ int main(int argc, char* argv[]) {
 
     // Fix the Wayland appId. This needs to match the name of the .desktop file without the .desktop
     // suffix.
-    QGuiApplication::setDesktopFileName(QStringLiteral("io.github.zortos293.lichii"));
+    QGuiApplication::setDesktopFileName(QStringLiteral("io.github.justr4mzi.hortensia"));
 #endif
 
     auto rounding_policy = GetHighDpiRoundingPolicy();

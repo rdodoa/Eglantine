@@ -265,7 +265,17 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                                         const PlayTime::PlayTimeManager& play_time_manager,
                                         const FileSys::PatchManager& patch) {
     auto const file_type = loader.GetFileType();
-    auto const file_type_string = QString::fromStdString(Loader::GetFileTypeString(file_type));
+    // Hortensia: name the console next to the file type. Switch 2 titles use program IDs starting
+    // with 04, Switch 1 titles 01.
+    const u8 program_platform = static_cast<u8>(program_id >> 56);
+    const QString platform_string = program_platform == 0x04   ? QStringLiteral("Switch 2")
+                                    : program_platform == 0x01 ? QStringLiteral("Switch 1")
+                                                               : QString{};
+    auto const file_type_string =
+        platform_string.isEmpty()
+            ? QString::fromStdString(Loader::GetFileTypeString(file_type))
+            : QStringLiteral("%1 · %2").arg(
+                  platform_string, QString::fromStdString(Loader::GetFileTypeString(file_type)));
 
     QString patch_versions = GetGameListCachedObject(
         fmt::format("{:016X}", patch.GetTitleID()), "pv.txt", [&patch, &loader] {

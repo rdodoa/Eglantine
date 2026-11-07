@@ -151,6 +151,7 @@ void RendererOpenGL::Composite(std::span<const Tegra::FramebufferConfig> framebu
     rasterizer.TickFrame();
 
     context->SwapBuffers();
+    presented_frames.fetch_add(1, std::memory_order_relaxed);
     render_window.OnFrameDisplayed();
 }
 

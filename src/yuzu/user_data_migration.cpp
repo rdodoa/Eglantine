@@ -54,8 +54,9 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     name->setChecked(checkState);                                                                  \
     migration_prompt.addBox(name);
 
+    // Hortensia keeps Lichii's shader cache format, so the caches are worth bringing over.
     BUTTON(QCheckBox, clear_shaders, QObject::tr("Clear Shader Cache"), MigrationTooltipClearShader,
-           true)
+           false)
 
     u32 id = 0;
 

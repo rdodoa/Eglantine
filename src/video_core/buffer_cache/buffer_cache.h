@@ -1220,7 +1220,17 @@ void BufferCache<P>::BindHostVertexBuffers() {
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
             TouchBuffer(buffer, binding.buffer_id);
-            SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+            // Checking every page of a large vertex buffer for CPU writes cost 7% of Bananza's
+            // draw time; none of them became CPU modified since the last check: skip it.
+            Nx2SyncedVertexBuffer& synced = nx2_synced_vertex_buffers[index];
+            const u64 epoch = Nx2DrawTuning()
+                                  ? memory_tracker.CpuWriteEpoch(binding.device_addr, binding.size)
+                                  : ~u64{0};
+            if (epoch == ~u64{0} || synced.epoch != epoch || synced.buffer_id != binding.buffer_id ||
+                synced.device_addr != binding.device_addr || synced.size != binding.size) {
+                SynchronizeBuffer(buffer, binding.device_addr, binding.size);
+                synced = {binding.buffer_id, binding.device_addr, binding.size, epoch};
+            }
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
                 continue;
@@ -2014,7 +2024,8 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
     }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
-    gpu_modified_ranges.Add(device_addr, size);
+    Nx2AddRangeOnce(gpu_modified_ranges, nx2_recent_gpu_ranges, nx2_recent_gpu_next, device_addr,
+                    size);
     QueueFenceDownload(device_addr, size);
     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         Tegra::Nx2MarkGpuWritten(device_addr, size);
@@ -2398,6 +2409,8 @@ void BufferCache<P>::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
 template <class P>
 BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
                                       bool sparse_compatible) {
+    // The synchronized-range tables hold Buffer pointers and ids that this may move or reuse.
+    nx2_synced_vertex_buffers.fill({});
     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -2773,6 +2786,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
 
 template <class P>
 void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+    nx2_synced_vertex_buffers.fill({});
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
     }

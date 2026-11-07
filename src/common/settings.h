@@ -358,7 +358,7 @@ struct Values {
                                                   true};
 
     SwitchableSetting<ScalingFilter> scaling_filter{linkage,
-                                                    ScalingFilter::ScaleForce,
+                                                    ScalingFilter::Bilinear,
                                                     "scaling_filter",
                                                     Category::Renderer,
                                                     Specialization::Default,
@@ -425,7 +425,7 @@ struct Values {
                                                 true};
 
     SwitchableSetting<bool> frame_gen{linkage, false, "frame_gen", Category::Renderer,
-                                      Specialization::Default, true, false};
+                                      Specialization::Default, true, true};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,
                                                    FrameGenType::Fsr3,
@@ -433,7 +433,7 @@ struct Values {
                                                    Category::Renderer,
                                                    Specialization::Default,
                                                    true,
-                                                   false,
+                                                   true,
                                                    &frame_gen};
 
     SwitchableSetting<u32, true> frame_gen_multiplier{linkage,
@@ -444,7 +444,7 @@ struct Values {
                                                       Category::Renderer,
                                                       Specialization::Countable,
                                                       true,
-                                                      false,
+                                                      true,
                                                       &frame_gen};
 
     SwitchableSetting<u32, true> frame_gen_target_rate{linkage,
@@ -615,6 +615,11 @@ struct Values {
     SwitchableSetting<bool> mkw_30fps{linkage, false, "mkw_30fps", Category::RendererAdvanced};
     SwitchableSetting<bool> mkw_dynamic_fps{linkage, false, "mkw_dynamic_fps",
                                             Category::RendererAdvanced};
+    // Donkey Kong Bananza: the game times its own frames (VRR reported in loader/nso.cpp, presents
+    // paced to every vblank in nx2_gsv.h), so its speed holds when the frame rate drops. From
+    // ZendNevs's Eglantine fork (v2.0.5).
+    SwitchableSetting<bool> dk_dynamic_fps{linkage, true, "dk_dynamic_fps",
+                                           Category::RendererAdvanced};
 
     SwitchableSetting<bool> use_reactive_flushing{linkage,
 #ifdef __ANDROID__
@@ -944,6 +949,12 @@ struct Values {
     Setting<bool> log_flush_line{linkage, false, "flush_line", Category::Miscellaneous, Specialization::Default, true, true};
     Setting<bool> censor_username{linkage, true, "censor_username", Category::Miscellaneous};
     Setting<bool> first_launch{linkage, true, "first_launch", Category::Miscellaneous};
+    // Hortensia: apply each supported game's optimized settings at boot without asking, adapted to
+    // the GPU vendor (common/game_presets.h). Asked once at the first start.
+    Setting<bool> hortensia_smart_presets{linkage, false, "hortensia_smart_presets",
+                                        Category::Miscellaneous};
+    Setting<bool> hortensia_smart_presets_asked{linkage, false, "hortensia_smart_presets_asked",
+                                              Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",

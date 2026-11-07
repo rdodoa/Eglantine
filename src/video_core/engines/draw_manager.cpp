@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <tuple>
@@ -342,6 +343,17 @@ void Maxwell3D::DrawManager::ProcessDraw(Maxwell3D& maxwell3d, bool draw_indexed
         draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count;
     LOG_TRACE(HW_GPU, "called, topology={}, count={}", draw_state.topology, draw_indexed ? draw_state.index_buffer.count : draw_state.vertex_buffer.count);
     UpdateTopology(maxwell3d);
+    // A draw with no vertices or no instances draws nothing: skip the pipeline, descriptor and
+    // buffer setup it would cost (Donkey Kong Bananza's terrain issues thousands per frame for
+    // pieces its culling pass left out). EDEN_NX2_DRAW_EMPTY=1 sends them anyway.
+    // From monteger8/Eglantine-DKB.
+    static const bool draw_empty = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_EMPTY");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!draw_empty && (draw_state.draw_element_count == 0 || instance_count == 0)) {
+        return;
+    }
     if (maxwell3d.ShouldExecute()) {
         maxwell3d.rasterizer->Draw(draw_indexed, instance_count);
     } else {

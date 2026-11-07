@@ -1058,6 +1058,7 @@ add_library(core STATIC
     hle/service/nx2_image_layout.h
     hle/service/nx2_present_pacer.h
     hle/service/nx2_video_ready.h
+    hle/service/nx2_gsv_server.h
     hle/service/services.cpp
     hle/service/services.h
     hle/service/set/factory_settings_server.cpp
@@ -1304,7 +1305,7 @@ else()
     target_sources(core PRIVATE hle/service/ssl/ssl_backend_none.cpp)
 endif()
 
-if (ENABLE_LTO AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
+if ((ENABLE_LTO OR CMAKE_CXX_FLAGS MATCHES "-flto") AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT MSVC)
     # Fibers can migrate between host threads; keep kernel TLS lookups outside LTO callers.
     set_source_files_properties(hle/kernel/kernel.cpp PROPERTIES COMPILE_OPTIONS -fno-lto)
 endif()

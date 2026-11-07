@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -62,6 +63,63 @@ void DrainBack() {
     VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::Acquire);
 }
 
+// With the split active, an acquire whose value is already in guest memory needs no drain: work
+// after it runs on the back after everything queued before it anyway. Semaphores here count up,
+// so a met value is not taken back by a queued release. EDEN_NX2_ACQUIRE_PEEK=0 always drains.
+// From sylvieistaken/selevet-eglantine.
+// Donkey Kong Bananza ran slower with it (monteger8/Eglantine-DKB measured the back idle 190 ms a
+// second against 80): off there unless EDEN_NX2_ACQUIRE_PEEK=1.
+bool PeekAcquire() {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_PEEK");
+        return value == nullptr ? -1 : value[0] != '0' ? 1 : 0;
+    }();
+    if (forced == 0 || !VideoCommon::GpuSplit::Get().Active()) {
+        return false;
+    }
+    if (forced == 1) {
+        return true;
+    }
+    constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+    static std::atomic<u64> cached_program{~u64{0}};
+    static std::atomic<bool> cached_result{true};
+    const u64 program = Settings::GetCurrentProgramID();
+    if (cached_program.load(std::memory_order_relaxed) != program) {
+        cached_result.store(program != DonkeyKongBananzaProgramId, std::memory_order_relaxed);
+        cached_program.store(program, std::memory_order_relaxed);
+    }
+    return cached_result.load(std::memory_order_relaxed);
+}
+
+void MarkSemaphorePage(DmaPusher& dma_pusher, GPUVAddr address) {
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+        Tegra::Nx2MarkSemaphorePage(*device);
+    }
+}
+
+// Releases queued for the split's back (GpuSplit::NoteQueuedRelease). Selevet measured Mario Kart
+// World's front draining the back ~40% of its time on acquires the 3D engine's queued releases
+// meet. EDEN_NX2_ACQUIRE_QUEUED=0 drains as before.
+void NoteQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
+    if (!Nx2AcquireQueuedEnabled() || !PeekAcquire()) {
+        return;
+    }
+    if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
+        VideoCommon::GpuSplit::Get().NoteQueuedRelease(*device, payload);
+    }
+}
+
+std::optional<u32> QueuedReleasePayload(DmaPusher& dma_pusher, GPUVAddr address) {
+    if (!Nx2AcquireQueuedEnabled() || !PeekAcquire()) {
+        return std::nullopt;
+    }
+    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return std::nullopt;
+    }
+    return VideoCommon::GpuSplit::Get().QueuedRelease(*device);
+}
+
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
@@ -87,6 +145,11 @@ bool Puller::PendingAcquire::Matches(u32 current) const {
 
 bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (!pending_acquire) {
+        return true;
+    }
+    if (PeekAcquire() &&
+        (Nx2SemaphoreWaiters::Get().Latched(this) ||
+         pending_acquire->Matches(dma_pusher.memory_manager.Read<u32>(pending_acquire->address)))) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
@@ -212,6 +275,7 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+    MarkSemaphorePage(dma_pusher, regs.semaphore_address.SemaphoreAddress());
     const auto semaphoreOperationMask = 0xF;
     const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & semaphoreOperationMask);
     // EDEN_NX2_SEM_WATCH=<gpu address>: log every release/acquire on the 16 bytes there.
@@ -238,6 +302,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, properties, payload] {
             rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload, properties, payload, 0);
         });
+        NoteQueuedRelease(dma_pusher, sequence_address, payload);
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
@@ -255,6 +320,13 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
             return;
         }
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
+        if (PeekAcquire() && acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+            return;
+        }
+        if (const auto queued = QueuedReleasePayload(dma_pusher, acquire.address);
+            queued && acquire.Matches(*queued)) {
+            return;
+        }
         DrainBack();
         if (acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
             return;
@@ -306,15 +378,18 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
 }
 
 void Puller::ProcessSemaphoreRelease(DmaPusher& dma_pusher) {
+    MarkSemaphorePage(dma_pusher, regs.semaphore_address.SemaphoreAddress());
     const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
     const u32 payload = regs.semaphore_release;
     OnBack([rasterizer = dma_pusher.rasterizer, sequence_address, payload] {
         rasterizer->Query(sequence_address, VideoCommon::QueryType::Payload,
                           VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
     });
+    NoteQueuedRelease(dma_pusher, sequence_address, payload);
 }
 
 void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+    MarkSemaphorePage(dma_pusher, regs.semaphore_address.SemaphoreAddress());
     DrainBack();
     u32 word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
     const auto value = regs.semaphore_acquire;
@@ -336,14 +411,23 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
                              (regs.reg_array[0x17] & ~3U);
     const u32 payload = regs.reg_array[0x19];
     const u32 operation = argument & 7;
+    MarkSemaphorePage(dma_pusher, address);
     if (operation == 1) { // RELEASE
         OnBack([rasterizer = dma_pusher.rasterizer, address, payload] {
             rasterizer->Query(address, VideoCommon::QueryType::Payload,
                               VideoCommon::QueryPropertiesFlags::IsAFence, payload, 0);
         });
+        NoteQueuedRelease(dma_pusher, address, payload);
         return;
     }
     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+    // The check only logs, so with the split the fences are released in order on the back instead
+    // of draining it. EDEN_NX2_SEMEXEC_DRAIN=1 drains as before (from selevet-eglantine).
+    static const bool semexec_drain = std::getenv("EDEN_NX2_SEMEXEC_DRAIN") != nullptr;
+    if (!semexec_drain && VideoCommon::GpuSplit::Get().Active()) {
+        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
+        return;
+    }
     DrainBack();
     ReleaseFences(dma_pusher);
     const u32 word = dma_pusher.memory_manager.Read<u32>(address);

@@ -1,8 +1,8 @@
-# Switch NX2 - read when the Lichii GUI starts.
+# Switch NX2 - read when the Hortensia GUI starts.
 # One NAME=VALUE per line. Lines starting with # are ignored.
 # A variable already set in the environment wins over this file.
-# Between files, the user copy (%APPDATA%\eden\nx2_switches.txt, or
-# $XDG_CONFIG_HOME/eden/nx2_switches.txt) wins over this one, so editing this file is never
+# Between files, the user copy (%APPDATA%\hortensia\nx2_switches.txt, or
+# $XDG_CONFIG_HOME/hortensia/nx2_switches.txt) wins over this one, so editing this file is never
 # needed: copy the lines you want into your own and restart.
 #
 # Restart the emulator after editing.
@@ -36,3 +36,67 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# --- Hortensia: optimizations ported from other forks (on by default; uncomment a line to undo it) ---
+# Selevet: semaphore acquires already met in memory don't drain the GPU thread (off in DK Bananza)
+#EDEN_NX2_ACQUIRE_PEEK=0
+# Selevet: acquires met by a release still queued for the GPU thread don't drain
+#EDEN_NX2_ACQUIRE_QUEUED=0
+# Selevet: SEM_EXECUTE acquires release fences on the back thread instead of draining
+#EDEN_NX2_SEMEXEC_DRAIN=1
+# Selevet: poll the host GPU up to 300 us before sleeping in the driver
+#EDEN_NX2_GPU_WAIT_SPIN_US=0
+# Selevet: high process priority (Windows)
+#EDEN_NX2_HIGH_PRIORITY=0
+# Selevet: tell the Switch 2 SDK the display supports VRR (steadier game speed)
+#EDEN_NX2_REPORT_VRR=0
+# Orchid / Eglantine-DKB: skip unchanged vertex buffer checks
+#EDEN_NX2_DRAW_TUNING=0
+# Eglantine-DKB: skip draws with no vertices or no instances
+#EDEN_NX2_DRAW_EMPTY=1
+# Eglantine-DKB (DK Bananza only): macro DMA reads of untouched pages skip the full drain
+#EDEN_NX2_DMA_DRAIN=1
+# Opt-in: skip small Switch 2 draws while their pipeline builds (less stutter, maybe missing effects)
+#EDEN_NX2_ASYNC_SKIP=1
+# Selevet: the timer thread sleeps through long waits (frees most of a CPU core on 6-core CPUs)
+#EDEN_TIMING_COARSE=0
+# Selevet: wake the timer thread only for a new earliest event (Donkey Kong Bananza)
+#EDEN_TIMING_WAKE_ALL=1
+# Orchid: Switch 2 graphics services run on their own host thread instead of emulated core 3
+#EDEN_NX2_GSV_HOST_THREAD=0
+# Orchid / Selevet: honour a swap interval above 1 only after N presents (Mario Kart World: 120)
+#EDEN_NX2_SWAP_STABLE=0
+# SmileyTatsu: Switch 2 pipelines are all built at boot and never evicted (less stutter in game)
+# notsapinho: storage reads of Switch 2 games are not paced (faster loading, Pokopia boots ~13 s faster)
+
+# --- Opt-in (off unless you set them) ---
+# Selevet: CPU float math as in Accurate mode while CPU accuracy stays on Unsafe/Auto
+#EDEN_CPU_ACCURATE_FLOAT=1
+#EDEN_CPU_FUSED_FMA=1
+#EDEN_CPU_GLOBAL_MONITOR=1
+# Selevet: skip compute shaders by hash (each new compute shader is logged as "Nx2 first dispatch");
+# put the last hashes before a "Device loss" here, comma separated, to work around a GPU hang
+#EDEN_NX2_SKIP_COMPUTE=
+
+# --- On in Hortensia (Ocarina of Time only), as in Selevet's recommended file ---
+# Lichii (zortos293), tuned by Selevet: Ocarina of Time fog/exposure/bloom reduction (the haze and
+# glare are not fixed at the source yet). Delete these lines to see the game unmodified.
+EDEN_NX2_OOT_VISUAL_WORKAROUND=1
+EDEN_NX2_OOT_FOG_SCALE=0.35
+EDEN_NX2_OOT_EXPOSURE_SCALE=0.75
+EDEN_NX2_OOT_BLOOM_EXP_SCALE=1.2
+
+# --- Opt-in, continued ---
+# Lichii (zortos293) "K4": report GPU time divided by N to Ampere games (Ocarina's dynamic resolution)
+#EDEN_NX2_GPU_TIME_DIV=4
+# Lichii (zortos293) prototype: record render passes in parallel
+#EDEN_NX2_PARALLEL_RECORD=1
+
+# --- AMD (chuppatricky / Matt Artist), automatic ---
+# Ocarina of Time shaders that crash or take minutes to build on AMD's Windows driver are built
+# unoptimized on drivers older than 2.0.388. =1 does it on any AMD driver, =0 never.
+#EDEN_NX2_AMD_SAFE_COMPILE=1
+# Every graphics pipeline unoptimized on AMD's Windows driver (crash near the Deku Tree)
+#EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS=1
+# Frizti: no wait before reading command lists on pages the GPU never wrote (experiment)
+#EDEN_NX2_LIST_WAIT_SKIP=1

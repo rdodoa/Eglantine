@@ -115,10 +115,35 @@ std::string BuildCommaSeparatedExtensions(
 
 Device CreateDevice(const vk::Instance& instance, const vk::InstanceDispatch& dld, VkSurfaceKHR surface) {
     const std::vector<VkPhysicalDevice> devices = instance.EnumeratePhysicalDevices();
-    const u32 device_index = Settings::values.vulkan_device.GetValue();
-    if (device_index >= u32(devices.size())) {
-        LOG_ERROR(Render_Vulkan, "Invalid device index {}!", device_index);
+    if (devices.empty()) {
+        LOG_ERROR(Render_Vulkan, "No Vulkan devices found!");
         throw vk::Exception(VK_ERROR_INITIALIZATION_FAILED);
+    }
+    const auto is_cpu = [&](u32 index) {
+        const auto type = vk::PhysicalDevice(devices[index], dld).GetProperties().deviceType;
+        return type == VK_PHYSICAL_DEVICE_TYPE_CPU || type == VK_PHYSICAL_DEVICE_TYPE_OTHER;
+    };
+    // First real GPU, so a saved index never lands on a software renderer (llvmpipe) by
+    // accident: the order of devices can change between runs and loaders.
+    const auto first_gpu = [&]() -> std::optional<u32> {
+        for (u32 i = 0; i < u32(devices.size()); ++i) {
+            if (!is_cpu(i)) {
+                return i;
+            }
+        }
+        return std::nullopt;
+    }();
+    u32 device_index = Settings::values.vulkan_device.GetValue();
+    if (device_index >= u32(devices.size())) {
+        const u32 fallback = first_gpu.value_or(0);
+        LOG_WARNING(Render_Vulkan, "Invalid device index {} ({} device(s) found), using device {}",
+                    device_index, devices.size(), fallback);
+        device_index = fallback;
+    } else if (is_cpu(device_index) && first_gpu) {
+        LOG_WARNING(Render_Vulkan,
+                    "Device {} is a software renderer, using GPU device {} instead",
+                    device_index, *first_gpu);
+        device_index = *first_gpu;
     }
     const vk::PhysicalDevice physical_device(devices[device_index], dld);
     return Device(*instance, physical_device, surface, dld);
@@ -248,6 +273,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
         frame_gen.GenerateInto(device, generated, generation);
         scheduler.Flush(*generated->render_ready);
         present_manager.Present(generated);
+        presented_frames.fetch_add(1, std::memory_order_relaxed);
     }
 #endif
 
@@ -259,6 +285,7 @@ void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebu
     const auto presenting = trace ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
     present_manager.Present(frame);
+    presented_frames.fetch_add(1, std::memory_order_relaxed);
     const auto presented = trace ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
 #ifdef HAS_LSFG

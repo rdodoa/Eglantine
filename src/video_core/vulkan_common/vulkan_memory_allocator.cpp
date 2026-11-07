@@ -13,18 +13,19 @@
 #include <utility>
 #include <vector>
 
+#include <ranges>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/literals.h"
 #include "common/logging.h"
-#include <ranges>
+#include "common/settings.h"
+#include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/renderer_vulkan/vk_gpu_breadcrumbs.h"
 #include "video_core/vulkan_common/vma.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
-#include "video_core/gpu_logging/gpu_logging.h"
-#include "common/settings.h"
 
 namespace Vulkan {
 namespace {
@@ -287,6 +288,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
         LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
                      ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
                      ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
+        Vulkan::GpuBreadcrumbs::Get().Dump("image allocation failed");
     }
     vk::Check(result);
 

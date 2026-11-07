@@ -172,6 +172,11 @@ protected:
     void UnregisterPending();
 
     ::Common::unordered_map<u64, ::Common::unordered_map<u32, QueryLocation>> cached_queries;
+    /// Fence-flagged Switch 2 reports whose write waits for their fence, by device address, so
+    /// conditional rendering asks the query rather than the stale guest word meanwhile.
+    ::Common::unordered_map<DAddr, QueryLocation> delayed_reports;
+    /// A delayed report rides on the next fence: it must wait for the host GPU (and submit).
+    std::atomic<bool> needs_real_fence{false};
     std::mutex cache_mutex;
 
     struct QueryCacheBaseImpl;

@@ -8,12 +8,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <bit>
@@ -29,6 +31,7 @@
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -380,6 +383,7 @@ struct DeferredStages {
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> runtime_infos;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
+    std::array<std::optional<Shader::Profile>, Maxwell::MaxShaderStage> profiles;
 };
 
 size_t GetTotalPipelineWorkers() {
@@ -456,6 +460,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       num_pipeline_workers{device.HasBrokenParallelShaderCompiling() ? 1ULL
                                                                      : GetTotalPipelineWorkers()},
       emission_budget{num_pipeline_workers},
+      oot_visual_workaround{[] {
+          const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+          return value != nullptr && std::string_view{value} == "1";
+      }()},
       workers(num_pipeline_workers, "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {}, Common::ThreadPlacement::Background),
       background_pipelines{64, 16 * 1024 * 1024, device.HasBrokenParallelShaderCompiling()} {
@@ -826,6 +834,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
+    visual_workaround_title = title_id;
     if (title_id == 0) {
         return;
     }
@@ -946,7 +955,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         if (!disk_pipelines.insert(hash).second) {
             return;
         }
-        if (!PreloadAllPipelines() &&
+        // Switch 2 titles stutter on pipelines built mid-game, so all of them are built at boot
+        // (from SmileyTatsu).
+        if (!PreloadAllPipelines() && !Settings::CurrentProgramIsSwitch2() &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
             ++skipped_pipelines;
@@ -1164,7 +1175,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
     constexpr u64 EvictAfterFrames = 9000;
-    if (frame_count <= EvictAfterFrames) {
+    // Switch 2 titles keep theirs: a rebuilt pipeline translates its shader on the GPU thread.
+    if (frame_count <= EvictAfterFrames || Settings::CurrentProgramIsSwitch2()) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -1281,6 +1293,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             return nullptr;
         }
 
+        // Without VK_EXT_mesh_shader the driver cannot build a task/mesh pipeline; the draw is
+        // skipped (see the pipeline check in the rasterizer).
+        if ((env.ShaderStage() == Shader::Stage::Task || env.ShaderStage() == Shader::Stage::Mesh) &&
+            !device.IsExtMeshShaderSupported()) {
+            return nullptr;
+        }
+
         const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
         Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
         if (!uses_vertex_a || index != 1) {
@@ -1293,6 +1312,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env);
         }
 
+        if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+                programs[index], program_id != 0 ? program_id : visual_workaround_title,
+                key.unique_hashes[index],
+                oot_visual_workaround)) {
+            LOG_WARNING(Render_Vulkan,
+                        "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                        key.unique_hashes[index], *edits);
+        }
         if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY && Shader::Optimization::HasBrokenPattern(programs[index])) {
             LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues", key.unique_hashes[index]);
             return nullptr;
@@ -1345,6 +1372,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     std::array<const Shader::Info*, Maxwell::MaxShaderStage> infos{};
     std::array<vk::ShaderModule, Maxwell::MaxShaderStage> modules;
     std::array<std::optional<Shader::RuntimeInfo>, Maxwell::MaxShaderStage> deferred_runtime_infos;
+    std::array<std::optional<Shader::Profile>, Maxwell::MaxShaderStage> deferred_profiles;
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 
     const Shader::IR::Program* previous_stage{};
@@ -1364,14 +1392,20 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
         ConvertLegacyToGeneric(program, runtime_info);
+        // From Orchid (after leadaenima/Lichii): on AMD graphics stages that can require 32-lane
+        // subgroups, dynamic-lane shuffles are emitted as a 32-lane broadcast loop.
+        Shader::Profile stage_profile{profile};
+        stage_profile.has_broken_spirv_dynamic_subgroup_shuffle =
+            device.NeedsGraphicsSubgroupShuffleWorkaround(MaxwellToVK::ShaderStage(program.stage));
         if (emit_pools) {
             deferred_runtime_infos[stage_index] = runtime_info;
+            deferred_profiles[stage_index] = stage_profile;
             if (VideoCommon::Nx2Perf::Verify()) {
-                reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
+                reference_spirv[stage_index] = EmitSPIRV(stage_profile, runtime_info, program, binding);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
-            modules[stage_index] = EmitShaderModule(device, profile, runtime_info, program, binding,
+            modules[stage_index] = EmitShaderModule(device, stage_profile, runtime_info, program, binding,
                                                    key.unique_hashes[index], stage_index);
             if (build_in_parallel) {
                 AddRuntimeSpirvTime(0, begin);
@@ -1387,6 +1421,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         job->programs = std::move(programs);
         job->runtime_infos = std::move(deferred_runtime_infos);
         job->reference_spirv = std::move(reference_spirv);
+        job->profiles = std::move(deferred_profiles);
         for (size_t stage = 0; stage < infos.size(); ++stage) {
             if (infos[stage]) {
                 infos[stage] = &job->programs[stage + 1].info;
@@ -1399,7 +1434,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             for (size_t stage = 0; stage < stage_modules.size(); ++stage) {
                 if (job->runtime_infos[stage]) {
                     stage_modules[stage] =
-                        EmitShaderModule(device, profile, *job->runtime_infos[stage],
+                        EmitShaderModule(device,
+                                         job->profiles[stage] ? *job->profiles[stage] : profile,
+                                         *job->runtime_infos[stage],
                                          job->programs[stage + 1], stage_binding,
                                          hashes[stage + 1], stage, job->reference_spirv[stage]);
                 }
@@ -1601,6 +1638,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     }
 
     auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    if (const auto edits = Shader::Optimization::ApplyOotVisualWorkaround(
+            program, program_id != 0 ? program_id : visual_workaround_title, key.unique_hash,
+            oot_visual_workaround)) {
+        LOG_WARNING(Render_Vulkan,
+                    "TEMPORARY OoT visual workaround: shader {:016x}, {} scalar edits",
+                    key.unique_hash, *edits);
+    }
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp =
         driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
@@ -1751,9 +1795,21 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
         file.read(cache_data.data(), cache_size);
 
         LOG_INFO(Render_Vulkan,
-                 "Loaded Vulkan driver pipeline cache: ", Common::FS::PathToUTF8String(filename));
+                 "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
-        return create_pipeline_cache(cache_size, cache_data.data());
+        try {
+            return create_pipeline_cache(cache_size, cache_data.data());
+        } catch (const vk::Exception& e) {
+            // The blob came from another driver or driver version (e.g. switching between
+            // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of
+            // aborting, and drop the stale file so the next run doesn't retry it.
+            LOG_ERROR(Render_Vulkan,
+                      "Driver rejected the Vulkan pipeline cache file ({}), starting with an empty "
+                      "cache and deleting it",
+                      e.what());
+            Common::FS::RemoveFile(filename);
+            return create_pipeline_cache(0, nullptr);
+        }
 
     } catch (const std::ios_base::failure& e) {
         LOG_ERROR(Common_Filesystem, "{}", e.what());

@@ -32,6 +32,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
+#include "video_core/renderer_vulkan/pipeline_compile_log.h"
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "video_core/nx2_profile.h"
@@ -306,6 +307,7 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
+    fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
@@ -1092,6 +1094,11 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
+        // A target the fragment shader never writes gets undefined values in Vulkan; AMD's
+        // drivers store garbage (dark outlines around Ocarina's castle from a depth-test pass).
+        if (index >= fragment_writes_color.size() || !fragment_writes_color[index]) {
+            write_mask = 0;
+        }
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
@@ -1220,7 +1227,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
     };
-    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
         .pNext = nullptr,
         .requiredSubgroupSize = GuestWarpSize,
@@ -1230,7 +1237,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (!spv_modules[stage]) {
             continue;
         }
-        [[maybe_unused]] auto& stage_ci =
+        auto& stage_ci =
             shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .pNext = nullptr,
@@ -1241,6 +1248,13 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
                 .pName = "main",
                 .pSpecializationInfo = nullptr,
             });
+        const Shader::Info& info{stage_infos[stage]};
+        const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
+                                   info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                                   info.uses_quad_shuffles || info.uses_fswzadd;
+        if (uses_warp_ops && device.NeedsGraphicsSubgroupShuffleWorkaround(stage_ci.stage)) {
+            stage_ci.pNext = &subgroup_size_ci;
+        }
     }
     VkPipelineCreateFlags flags{};
     if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
@@ -1249,7 +1263,46 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     if (uses_descriptor_buffer) {
         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
     }
+    // EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS=1: on AMD's proprietary driver, graphics pipelines are
+    // built without driver optimizations. Opt-in experiment for Ocarina of Time's crash inside
+    // vkCreateGraphicsPipelines around the Deku Tree (Eglantine #618: amdvlk64.dll access
+    // violation on one fragment shader, RDNA1/2/4); GPU time may go up.
+    static const bool safe_graphics = [] {
+        const char* const value = std::getenv("EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS");
+        return value != nullptr && value[0] == '1';
+    }();
+    // Two RX 6000 PCs on AMD's 2.0.353 driver died inside vkCreateGraphicsPipelines while these
+    // Ocarina fragment shaders compiled (all four were in flight both times). Like the large
+    // compute shaders, they are built without optimizations under EDEN_NX2_AMD_SAFE_COMPILE's rule:
+    // drivers older than 2.0.388 by default, any AMD proprietary driver with =1, never with =0.
+    static constexpr std::array<u64, 4> CRASHING_FRAGMENTS{
+        0x6c85c9f06e1d689bULL, 0x3d513889e2913d1cULL, 0x3c2193d0166610b3ULL, 0x4e54644c03577013ULL};
+    static const int safe_mode = [] {
+        const char* const value = std::getenv("EDEN_NX2_AMD_SAFE_COMPILE");
+        return value == nullptr || value[0] == '\0' ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    const bool amd_proprietary = device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+    const bool crashing_fragment =
+        amd_proprietary && safe_mode != 0 &&
+        (safe_mode == 1 || device.GetDriverVersion() < VK_MAKE_API_VERSION(0, 2, 0, 388)) &&
+        std::ranges::find(CRASHING_FRAGMENTS, key.unique_hashes[Maxwell::MaxShaderProgram - 1]) !=
+            CRASHING_FRAGMENTS.end();
+    const bool unoptimized = amd_proprietary && (safe_graphics || crashing_fragment);
+    if (unoptimized) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
 
+    std::string compile_shaders;
+    if (LogPipelineCompiles()) {
+        for (size_t stage = 0; stage < key.unique_hashes.size(); ++stage) {
+            if (key.unique_hashes[stage] != 0) {
+                compile_shaders += fmt::format("{}s{}:{:016x}", compile_shaders.empty() ? "" : " ",
+                                               stage, key.unique_hashes[stage]);
+            }
+        }
+    }
+    const PipelineCompileLog compile_log{unoptimized ? "graphics (unoptimized)" : "graphics",
+                                         std::move(compile_shaders)};
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,

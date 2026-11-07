@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <optional>
 
@@ -384,6 +385,7 @@ private slots:
     void OnToggleGraphicsAPI();
     void OnToggleDockedMode();
     void OnToggleGpuAccuracy();
+    void OnToggleFrameGen();
     void OnToggleAdaptingFilter();
     void OnConfigurePerGame();
     void OnLoadAmiibo();
@@ -392,6 +394,7 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnCreateBugReport();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -459,9 +462,11 @@ private:
     void UpdateFilterText();
     void UpdateAAText();
     void UpdatePostShaderText();
+    void UpdateFrameGenText();
     void UpdateVolumeUI();
     void UpdateStatusBar();
     void UpdateGPUAccuracyButton();
+    void UpdateFrameGenButton();
     void UpdateStatusButtons();
     void UpdateUISettings();
     void UpdateInputDrivers();
@@ -507,6 +512,7 @@ private:
     MultiplayerState* multiplayer_state = nullptr;
     bool use_recommended_mkw_settings = false;
     bool asked_recommended_mkw_settings = false;
+    QAction* hortensia_smart_presets_action = nullptr;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
@@ -529,16 +535,21 @@ private:
     QLabel* res_scale_label = nullptr;
     QLabel* emu_speed_label = nullptr;
     QLabel* game_fps_label = nullptr;
+    QLabel* display_fps_label = nullptr;
+    u64 display_frames_seen{};
+    std::chrono::steady_clock::time_point display_frames_time{};
     QLabel* emu_frametime_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
     QPushButton* gpu_accuracy_button = nullptr;
+    QPushButton* frame_gen_button = nullptr;
     QPushButton* renderer_status_button = nullptr;
     QPushButton* refresh_button = nullptr;
     QPushButton* dock_status_button = nullptr;
     QPushButton* filter_status_button = nullptr;
     QPushButton* aa_status_button = nullptr;
     QPushButton* post_shader_status_button = nullptr;
+    QPushButton* frame_gen_status_button = nullptr;
     VolumeButton* volume_button = nullptr;
     QWidget* volume_popup = nullptr;
     QSlider* volume_slider = nullptr;

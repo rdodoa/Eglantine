@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1183,6 +1184,29 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
     } else {
         split.Method(this, method, argument, is_last_call, nullptr);
     }
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
+        const GPUVAddr report_address =
+            (GPUVAddr{fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)]} << 32) |
+            fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        if (const auto device = memory_manager.GpuToCpuAddress(report_address)) {
+            Nx2MarkSemaphorePage(*device);
+        }
+    }
+    // A payload release (ProcessQueryGet) is now queued: acquires it meets need not drain.
+    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query) && Nx2AcquireQueuedEnabled()) {
+        Regs::ReportSemaphore report{};
+        report.address_high = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_high)];
+        report.address_low = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.address_low)];
+        report.payload = fs.regs[MAXWELL3D_REG_INDEX(report_semaphore.payload)];
+        report.query.raw = value;
+        if (report.query.operation == Regs::ReportSemaphore::Operation::Release &&
+            report.query.report.Value() == Regs::ReportSemaphore::Report::Payload &&
+            report.query.reduction_enable == 0) {
+            if (const auto device = memory_manager.GpuToCpuAddress(report.Address())) {
+                split.NoteQueuedRelease(*device, report.payload);
+            }
+        }
+    }
 }
 
 void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
@@ -1305,6 +1329,11 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
         const auto read = [&fs](u32 address) {
             return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
         };
+        // Only Donkey Kong Bananza was measured with the untouched-page skip: Ocarina of Time's
+        // fog reads query results this way, which the page check does not see.
+        constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+        const bool dma_skip_untouched =
+            system.GetApplicationProcessProgramID() == DonkeyKongBananzaProgramId;
         const auto emit = [&](u32 address, u32 value) {
             if (address >= MacroRegistersStart) {
                 return false;
@@ -1312,7 +1341,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             FrontWrite(split, fs, address, value, true, true);
             // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
             if (address == 0x157 || address == 0x158) {
-                FrontDmaRead(split, fs, method, address, value);
+                FrontDmaRead(split, fs, method, address, value, dma_skip_untouched);
             }
             return true;
         };
@@ -1344,7 +1373,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
 }
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 macro,
-                             u32 method, u32 count) {
+                             u32 method, u32 count, bool skip_untouched) {
     // The words may be written by methods still queued for the back (indirect draw arguments
     // from a culling dispatch), and the caches that may hold newer ones belong to it.
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
@@ -1357,6 +1386,33 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         memory_manager.ReadBlockUnsafe(source, diag_before.data(), read_bytes);
     }
     VideoCommon::Nx2Profile::CountDmaRead(macro);
+    // Donkey Kong Bananza's ~500 reads a second are of pages no shader, copy or semaphore ever
+    // wrote; for those, wait only for the compute and copy work queued (which could write such a
+    // page for the first time), not for every draw. EDEN_NX2_DMA_DRAIN=1 always waits for
+    // everything. From monteger8/Eglantine-DKB.
+    static const bool always_drain = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_DRAIN");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool gpu_written_source = always_drain || !diag_before.empty() || !skip_untouched;
+    for (GPUVAddr page = source & ~GPUVAddr{0xfff};
+         !gpu_written_source && page < source + read_bytes; page += 0x1000) {
+        const auto device = memory_manager.GpuToCpuAddress(page);
+        gpu_written_source = !device || Tegra::Nx2IsGpuWritten(*device) ||
+                             Tegra::Nx2IsSemaphorePage(*device);
+    }
+    if (!gpu_written_source) {
+        split.WaitForWriters();
+        for (u32 i = 0; i < words; ++i) {
+            const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+            if (method == 0x158) {
+                fs.parameters.push_back(word);
+            } else if (ram + i < native_data_ram.size()) {
+                native_data_ram[ram + i] = word;
+            }
+        }
+        return;
+    }
     split.Drain(VideoCommon::DrainSite::MacroDmaRead);
     if (VideoCommon::QueryDma::TraceEnabled()) {
         split.Run(

@@ -1,0 +1,8 @@
+[Icon Theme]
+Name=hortensia
+Comment=Hortensia theme (dark, pink and orchid)
+Inherits=colorful_dark
+Directories=16x16
+
+[16x16]
+Size=16

@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "common/common_types.h"
+#include "common/settings_enums.h"
 #include "video_core/renderer_vulkan/present/frame_gen_pacer.h"
 #include "video_core/renderer_vulkan/present/lsfg_chain.h"
 #include "video_core/renderer_vulkan/present/lsfg_shaders.h"
@@ -47,6 +48,7 @@ private:
     VkExtent2D built_extent{};
     VkFormat built_format{VK_FORMAT_UNDEFINED};
     f32 built_flow_scale{};
+    Settings::FrameGenType built_type{Settings::FrameGenType::Fsr3};
     u64 frame_count{};
     u64 last_count{};
     size_t last_generations{};
@@ -54,6 +56,11 @@ private:
     bool generated{};
     bool unavailable{};
     bool dumped{};
+    u32 frames_without_storage{};
+    u32 reported{}; ///< REPORTED_* log lines already written since frame generation was turned on
+    static constexpr u32 REPORTED_NO_LSFG = 1U << 0;
+    static constexpr u32 REPORTED_NO_STORAGE = 1U << 1;
+    static constexpr u32 REPORTED_RUNNING = 1U << 2;
 };
 
 } // namespace Vulkan

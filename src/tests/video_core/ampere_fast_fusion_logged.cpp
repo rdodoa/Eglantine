@@ -618,12 +618,46 @@ TEST_CASE("Ocarina F2IP packs two rounded unorm bytes", "[video_core][ampere][oo
             CHECK(translation.registers[39] == std::bit_cast<u32>(b));
         }
     }
-    // Other rounding modes and a merge register aren't known forms yet.
+    // Rounding in bits 78-79 (1: toward -infinity, Ocarina's Max Resolution compute) and a merge
+    // register Rc in bits 64-71 (cvt.pack: Rc << 16 | byte(Ra) << 8 | byte(Rb)).
+    const auto run = [&](const Instruction& insn, f32 a, f32 b, u32 merge) {
+        const auto result = LowerToMaxwell(std::array{insn, Exit});
+        INFO(result.error);
+        REQUIRE(result);
+        HalfIR run_translation{result.instructions};
+        run_translation.registers.fill(0xdeadbeef);
+        run_translation.registers[40] = std::bit_cast<u32>(a);
+        run_translation.registers[39] = std::bit_cast<u32>(b);
+        run_translation.registers[6] = merge;
+        for (const auto& inst : run_translation.block.Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::SetRegister)
+                run_translation.registers.at(static_cast<size_t>(inst.Arg(0).Reg())) =
+                    u32(run_translation.Value(inst.Arg(1)));
+            else
+                run_translation.values.emplace(&inst, run_translation.Evaluate(inst));
+        }
+        return run_translation.registers[41];
+    };
+    const auto floor_byte = [](f32 input) {
+        return std::isnan(input) ? 0U : u32(std::floor(std::clamp(input, 0.0f, 255.0f)));
+    };
     auto modified = convert;
     modified.words[2] = 0x000044ff;
-    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
+    for (const f32 a : inputs) {
+        for (const f32 b : inputs) {
+            CAPTURE(a, b);
+            CHECK(run(modified, a, b, 0) == (floor_byte(b) | (floor_byte(a) << 8)));
+        }
+    }
     modified = convert;
     modified.words[2] = 0x00000406;
+    CHECK(run(modified, 0.75f, 254.75f, 0x1234) == (0x1234U << 16 | byte(0.75f) << 8 | byte(254.75f)));
+    // An unknown type or a register past the uniform mirror is still rejected.
+    modified = convert;
+    modified.words[2] = 0x000014ff;
+    CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
+    modified = convert;
+    modified.words[2] = 0x000004f8;
     CHECK_FALSE(LowerToMaxwell(std::array{modified, Exit}));
 }
 

@@ -198,10 +198,34 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (!gpu_written && VideoCommon::GpuSplit::Get().Active() &&
-            VideoCommon::GpuSplit::Get().WaitForWriters()) {
-            gpu_written =
-                IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        // EDEN_NX2_LIST_WAIT_SKIP=1 (experiment): no wait for queued compute and copies before
+        // reading a list on pages no GPU work has written yet. The wait only catches the first
+        // GPU write to a page (the bits stay set); the back checks, at the list's place, whether
+        // that happened and logs each list the skip read stale.
+        static const bool skip_list_wait = [] {
+            const char* const value = std::getenv("EDEN_NX2_LIST_WAIT_SKIP");
+            return value != nullptr && value[0] == '1';
+        }();
+        if (!gpu_written && VideoCommon::GpuSplit::Get().Active()) {
+            auto& split = VideoCommon::GpuSplit::Get();
+            if (skip_list_wait) {
+                split.Defer([this, address = GPUVAddr{dma_state.dma_get},
+                             size = size_t{header.size} * sizeof(u32)] {
+                    if (IsGpuWrittenCommands(address, size)) {
+                        static std::atomic<u32> missed{};
+                        const u32 count = ++missed;
+                        if (count <= 32 || (count & (count - 1)) == 0) {
+                            LOG_WARNING(HW_GPU,
+                                        "EDEN_NX2_LIST_WAIT_SKIP: command list at {:#x} ({} bytes) "
+                                        "was GPU-written by work queued before it ({} so far)",
+                                        address, size, count);
+                        }
+                    }
+                });
+            } else if (split.WaitForWriters()) {
+                gpu_written =
+                    IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+            }
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
         const bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&

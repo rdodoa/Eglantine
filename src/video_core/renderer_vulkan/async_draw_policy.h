@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdlib>
 
 #include "common/common_types.h"
 

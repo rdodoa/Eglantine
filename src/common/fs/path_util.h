@@ -55,6 +55,23 @@ enum EmuPath {
     SuyuConfigDir,
     SuyuCacheDir,
 
+    // Hortensia: the Switch 2 forks it is built from
+    LichiiDir,
+    LichiiConfigDir,
+    LichiiCacheDir,
+
+    EdenLegacyDir,
+    EdenLegacyConfigDir,
+    EdenLegacyCacheDir,
+
+    BouquetDir,
+    BouquetConfigDir,
+    BouquetCacheDir,
+
+    EglantineDir,
+    EglantineConfigDir,
+    EglantineCacheDir,
+
     // used exclusively for save data linking
     RyujinxDir,
 };

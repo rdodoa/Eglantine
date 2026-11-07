@@ -196,6 +196,7 @@ RangeSet<AddressType>::RangeSet(RangeSet&& other) {
     // A moved-from container is only "valid but unspecified". Callers hand ranges over by
     // moving and then keep adding to the source (BufferCache::AccumulateFlushes).
     other.m_impl->m_ranges_set.clear();
+    ++other.m_removals;
 }
 
 template <typename AddressType>
@@ -203,6 +204,8 @@ RangeSet<AddressType>& RangeSet<AddressType>::operator=(RangeSet&& other) {
     if (this != &other) {
         m_impl->m_ranges_set = std::move(other.m_impl->m_ranges_set);
         other.m_impl->m_ranges_set.clear();
+        ++m_removals;
+        ++other.m_removals;
     }
     return *this;
 }
@@ -214,11 +217,13 @@ void RangeSet<AddressType>::Add(AddressType base_address, size_t size) {
 
 template <typename AddressType>
 void RangeSet<AddressType>::Subtract(AddressType base_address, size_t size) {
+    ++m_removals;
     m_impl->Subtract(base_address, size);
 }
 
 template <typename AddressType>
 void RangeSet<AddressType>::Clear() {
+    ++m_removals;
     m_impl->m_ranges_set.clear();
 }
 

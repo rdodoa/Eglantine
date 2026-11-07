@@ -452,6 +452,28 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
     default:
         break;
     }
+    // From Selevet. EDEN_CPU_GLOBAL_MONITOR=1: keep exclusive accesses checked across cores (Auto
+    // and Unsafe ignore the global monitor). EDEN_CPU_FUSED_FMA=1: keep multiply-adds fused.
+    // EDEN_CPU_ACCURATE_FLOAT=1: NaNs and float precision as Accurate does, while the rest of the
+    // CPU accuracy stays on Unsafe/Auto.
+    const auto env_flag = [](const char* name) {
+        const char* const value = std::getenv(name);
+        return value != nullptr && value[0] == '1';
+    };
+    static const bool keep_global_monitor = env_flag("EDEN_CPU_GLOBAL_MONITOR");
+    static const bool keep_fused_fma = env_flag("EDEN_CPU_FUSED_FMA");
+    static const bool accurate_float = env_flag("EDEN_CPU_ACCURATE_FLOAT");
+    if (keep_global_monitor) {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+    }
+    if (keep_fused_fma) {
+        config.optimizations &= ~Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA;
+    }
+    if (accurate_float) {
+        config.optimizations &= ~(Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
+                                  Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+                                  Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue);
+    }
     if (!Settings::IsFastmemEnabled()) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;

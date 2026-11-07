@@ -37,6 +37,10 @@
 #define SUDACHI_DIR "sudachi"
 #define YUZU_DIR "yuzu"
 #define SUYU_DIR "suyu"
+#define LICHII_DIR "lichii"
+#define EDEN_LEGACY_DIR "eden"
+#define BOUQUET_DIR "bouquet"
+#define EGLANTINE_DIR "eglantine"
 #define RYUJINX_DIR "Ryujinx"
 
 // yuzu-specific files

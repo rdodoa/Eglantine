@@ -42,18 +42,17 @@ constexpr VkDeviceSize MAX_STREAM_BUFFER_SIZE = 128_MiB;
 
 size_t GetStreamBufferSize(const Device& device) {
     if (!device.HasDebuggingToolAttached()) {
-        if (device.IsIntegrated()) {
-            // An integrated GPU's device-local host-visible heap can be no bigger than the stream
-            // buffer (Radeon 780M: 256 MiB, 243 MiB budget), which then sat over that budget.
-            // Leave a quarter of it free.
-            VkDeviceSize heap_size = 0;
-            ForEachDeviceLocalHostVisibleHeap(
-                device, [&heap_size](size_t, VkMemoryHeap& heap) {
-                    heap_size = (std::max)(heap_size, heap.size);
-                });
-            if (heap_size != 0 && heap_size <= MAX_STREAM_BUFFER_SIZE) {
-                return Common::AlignUp(heap_size * 3 / 4, MAX_ALIGNMENT);
-            }
+        // The device-local host-visible heap can be no bigger than the stream buffer: an
+        // integrated GPU's (Radeon 780M: 256 MiB, 243 MiB budget), or a discrete GPU's BAR
+        // without Resizable BAR (256 MiB). A buffer that size doesn't fit the heap's budget, so
+        // VMA put it in system memory and the GPU read every uniform and index buffer from it
+        // over PCIe. Leave a quarter of the heap free so it stays in video memory.
+        VkDeviceSize heap_size = 0;
+        ForEachDeviceLocalHostVisibleHeap(device, [&heap_size](size_t, VkMemoryHeap& heap) {
+            heap_size = (std::max)(heap_size, heap.size);
+        });
+        if (heap_size != 0 && heap_size <= MAX_STREAM_BUFFER_SIZE) {
+            return Common::AlignUp(heap_size * 3 / 4, MAX_ALIGNMENT);
         }
         return MAX_STREAM_BUFFER_SIZE;
     }

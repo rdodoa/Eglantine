@@ -23,28 +23,30 @@ std::vector<Asset> Release::GetPlatformAssets() const {
 }
 
 std::vector<Asset> Release::GetPlatformAssets(std::string_view platform) const {
-    std::vector<std::string_view> extensions;
-    if (platform == "linux-x86_64" || platform == "linux-x86_64-pgo" ||
-        platform == "linux-aarch64" || platform == "linux-aarch64-pgo") {
-        extensions = {".AppImage", ".tar.gz"};
-    } else if (platform == "windows-x86_64" || platform == "windows-x86_64-pgo" ||
-               platform == "macos-arm64") {
-        extensions = {".zip"};
+    // Hortensia releases carry one friendly file name per system (release-binaries.yml).
+    std::string_view filename;
+    if (platform == "windows-x86_64-pgo-avx2" || platform == "windows-x86_64-pgo") {
+        filename = "Hortensia-Windows.zip";
+    } else if (platform == "windows-x86_64") {
+        filename = "Hortensia-Windows-Compatibility.zip";
+    } else if (platform == "linux-x86_64" || platform == "linux-x86_64-pgo") {
+        filename = "Hortensia-Linux.AppImage";
+    } else if (platform == "linux-aarch64" || platform == "linux-aarch64-pgo") {
+        filename = "Hortensia-Linux-ARM.AppImage";
+    } else if (platform == "macos-arm64") {
+        filename = "Hortensia-macOS.zip";
     } else {
         return {};
     }
 
     const std::string host_url = "https://github.com";
     const auto path = fmt::format("/{}/releases/download/{}/", Common::g_build_auto_update_repo, tag);
-    for (const auto extension : extensions) {
-        const auto filename = fmt::format("lichii-{}{}", platform, extension);
-        for (const auto& asset : assets) {
-            if (asset == host_url + path + filename) {
-                return {{.name = platform.ends_with("-pgo") ? "PGO" : "Standard",
-                         .url = host_url,
-                         .path = path + filename,
-                         .filename = filename}};
-            }
+    for (const auto& asset : assets) {
+        if (asset == host_url + path + std::string{filename}) {
+            return {{.name = "Hortensia",
+                     .url = host_url,
+                     .path = path + std::string{filename},
+                     .filename = std::string{filename}}};
         }
     }
     return {};
@@ -172,7 +174,7 @@ std::optional<std::string> MakeRequest(const std::string& url, const std::string
         httplib::Request request{
             .method = "GET",
             .path = path,
-            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Lichii"}},
+            .headers = {{"Accept", "application/vnd.github+json"}, {"User-Agent", "Hortensia"}},
         };
 
         client->set_follow_location(true);
@@ -205,7 +207,7 @@ std::vector<Release> GetReleases() {
     const auto body = GetReleasesBody();
 
     if (!body) {
-        LOG_WARNING(Common, "Failed to get Lichii releases");
+        LOG_WARNING(Common, "Failed to get Hortensia releases");
         return {};
     }
 

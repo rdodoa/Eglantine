@@ -149,7 +149,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Runs a Switch 2 game's own DLSS (its upscaling network, translated for this GPU) "
               "instead of AMD FSR 3.1 in its place.\nAMD FSR 3.1 still draws while the network is "
               "checked, when it can't run on this GPU, with resolution scaling, and for the rest "
-              "of the session if its output fails Lichii's checks.\nTakes effect when a game "
+              "of the session if its output fails Hortensia's checks.\nTakes effect when a game "
               "starts."));
     INSERT(Settings, fsr_sharpening_slider, tr("RCAS Sharpness:"),
            tr("Strength of RCAS (AMD's contrast-adaptive sharpening) on the upscaler used in place "
@@ -158,7 +158,7 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
-              "the NVIDIA app has downloaded it; Lichii does not ship NVIDIA's files. Use the "
+              "the NVIDIA app has downloaded it; Hortensia does not ship NVIDIA's files. Use the "
               "download button below.\nCurrently requires Fire Emblem: Fortune's Weave and "
               "EDEN_NX2_DLSS_REPLACEMENT=dlss. Without that override, its spatial workaround "
               "remains active.\nTakes effect when a game starts."));
@@ -295,6 +295,10 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Lets the game adjust between 30 and 60 FPS using whole-frame timing to maintain "
               "normal game speed. Takes effect after restarting the game and takes precedence over "
               "the 30 FPS mode."));
+    INSERT(Settings, dk_dynamic_fps, tr("Donkey Kong Bananza: dynamic FPS (experimental)"),
+           tr("The game times its own frames, so its speed holds when the frame rate drops, and "
+              "it is never held at 20 or 30 fps. It never runs faster than 60.\nTakes effect at "
+              "the next game launch."));
     INSERT(Settings, barrier_feedback_loops, tr("Barrier feedback loops"),
            tr("Improves rendering of transparency effects in specific games."));
     INSERT(Settings, enable_buffer_history, tr("Enable buffer history"),

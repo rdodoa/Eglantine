@@ -237,6 +237,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdEndDebugUtilsLabelEXT vkCmdEndDebugUtilsLabelEXT{};
     PFN_vkCmdEndQuery vkCmdEndQuery{};
     PFN_vkCmdEndRenderPass vkCmdEndRenderPass{};
+    PFN_vkCmdExecuteCommands vkCmdExecuteCommands{};
     PFN_vkCmdEndTransformFeedbackEXT vkCmdEndTransformFeedbackEXT{};
     PFN_vkCmdFillBuffer vkCmdFillBuffer{};
     PFN_vkCmdPipelineBarrier vkCmdPipelineBarrier{};
@@ -245,6 +246,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdPushDescriptorSetWithTemplateKHR vkCmdPushDescriptorSetWithTemplateKHR{};
     PFN_vkCmdResetQueryPool vkCmdResetQueryPool{};
     PFN_vkCmdWriteTimestamp vkCmdWriteTimestamp{};
+    PFN_vkCmdWriteBufferMarkerAMD vkCmdWriteBufferMarkerAMD{};
     PFN_vkCmdResolveImage vkCmdResolveImage{};
     PFN_vkCmdSetBlendConstants vkCmdSetBlendConstants{};
     PFN_vkCmdSetCullModeEXT vkCmdSetCullModeEXT{};
@@ -642,6 +644,11 @@ using DebugUtilsMessenger = Handle<VkDebugUtilsMessengerEXT, VkInstance, Instanc
 using DebugReportCallback = Handle<VkDebugReportCallbackEXT, VkInstance, InstanceDispatch>;
 using DescriptorSetLayout = Handle<VkDescriptorSetLayout, VkDevice, DeviceDispatch>;
 using DescriptorUpdateTemplate = Handle<VkDescriptorUpdateTemplate, VkDevice, DeviceDispatch>;
+
+/// Bytes a template created through Device reads from its data pointer, and its bind point; 0
+/// for templates it doesn't know.
+std::size_t DescriptorUpdateTemplateDataSize(VkDescriptorUpdateTemplate update_template,
+                                             VkPipelineBindPoint& bind_point);
 using Pipeline = Handle<VkPipeline, VkDevice, DeviceDispatch>;
 using PipelineLayout = Handle<VkPipelineLayout, VkDevice, DeviceDispatch>;
 using QueryPool = Handle<VkQueryPool, VkDevice, DeviceDispatch>;
@@ -1267,6 +1274,10 @@ public:
         dld->vkCmdEndRenderPass(handle);
     }
 
+    void ExecuteCommands(Span<VkCommandBuffer> secondaries) const noexcept {
+        dld->vkCmdExecuteCommands(handle, secondaries.size(), secondaries.data());
+    }
+
     void BeginQuery(VkQueryPool query_pool, u32 query, VkQueryControlFlags flags) const noexcept {
         dld->vkCmdBeginQuery(handle, query_pool, query, flags);
     }
@@ -1282,6 +1293,11 @@ public:
     void WriteTimestamp(VkPipelineStageFlagBits stage, VkQueryPool query_pool,
                         u32 query) const noexcept {
         dld->vkCmdWriteTimestamp(handle, stage, query_pool, query);
+    }
+
+    void WriteBufferMarkerAMD(VkPipelineStageFlagBits stage, VkBuffer buffer, VkDeviceSize offset,
+                              u32 marker) const noexcept {
+        dld->vkCmdWriteBufferMarkerAMD(handle, stage, buffer, offset, marker);
     }
 
     void BindDescriptorSets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, u32 first,
