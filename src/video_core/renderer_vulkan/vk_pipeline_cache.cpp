@@ -1222,7 +1222,11 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     // waiting for it (experimental; the draw may be missing for a frame or more).
     /// Reads EDEN_NX2_ASYNC_DISCARD once and logs when it is on.
     static const bool discard_native = [] {
+        // EDEN_NX2_ASYNC_SKIP is Hortensia's name for the same switch (nx2_switches.txt).
         const char* value = std::getenv("EDEN_NX2_ASYNC_DISCARD");
+        if (value == nullptr) {
+            value = std::getenv("EDEN_NX2_ASYNC_SKIP");
+        }
         const bool enabled = value != nullptr && value[0] == '1';
         if (enabled) {
             LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_DISCARD: native draws skip unbuilt pipelines");
