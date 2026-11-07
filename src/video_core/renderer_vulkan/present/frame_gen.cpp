@@ -217,6 +217,11 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                     "Frame generation is off: Lossless Scaling (LSFG) is selected but Lossless.dll "
                     "was not loaded from the lossless folder. Pick the built-in type or add the DLL.");
     }
+    if (unavailable) {
+        state.store(shaders->IsDeviceSupported() ? VideoCore::FrameGenState::MissingLosslessDll
+                                                 : VideoCore::FrameGenState::UnsupportedGpu,
+                    std::memory_order_relaxed);
+    }
     if (unavailable || !Settings::values.frame_gen.GetValue()) {
         if (chain || fsr3_chain) {
             scheduler.Finish();
@@ -228,6 +233,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
     }
 
     if (!frame->storage_view) {
+        state.store(VideoCore::FrameGenState::UnsupportedSurface, std::memory_order_relaxed);
         warm_streak = 0;
         // A frame gets its storage view at its next present; after that, none means the
         // display image format can't be written by compute shaders on this GPU.
@@ -241,6 +247,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         return;
     }
     frames_without_storage = 0;
+    state.store(VideoCore::FrameGenState::Running, std::memory_order_relaxed);
 
     peak_guest_extent.width = (std::max)(peak_guest_extent.width, guest_extent.width);
     peak_guest_extent.height = (std::max)(peak_guest_extent.height, guest_extent.height);
@@ -265,6 +272,7 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
                  plan.generations,
                  type == Settings::FrameGenType::Fsr3 ? "built-in optical flow" : "LSFG");
     }
+    generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
 
     const bool use_fsr3 = built_type == Settings::FrameGenType::Fsr3;
 

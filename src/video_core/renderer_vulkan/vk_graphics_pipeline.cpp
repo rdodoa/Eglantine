@@ -14,6 +14,7 @@
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 
 #include "common/bit_field.h"
@@ -307,7 +308,12 @@ GraphicsPipeline::GraphicsPipeline(
         num_descriptor_entries += NumDescriptorEntries(*info);
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
-    fragment_writes_color = stage_infos[NUM_STAGES - 1].stores_frag_color;
+    // The guest leaves render target components the fragment shader doesn't output untouched,
+    // while Vulkan writes undefined values to them (AMD writes garbage), so they are masked out.
+    for (size_t rt = 0; rt < Maxwell::NumRenderTargets; ++rt) {
+        color_output_mask |= u32{stage_infos[NUM_STAGES - 1].frag_color_components[rt]}
+                             << (rt * 4);
+    }
     const auto any_written = [](const auto& descriptors) {
         return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
     };
@@ -444,7 +450,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                            return cbuf < cbufs.size() && cbufs[cbuf].enabled
                                                       ? cbufs[cbuf].address
                                                       : GPUVAddr{};
-                                       }),
+                                       },
+                                       device.GetStorageBufferAlignment()),
                                    via_header_index);
             }
             ASSERT(cbufs[desc.cbuf_index].enabled);
@@ -1094,11 +1101,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         for (size_t i = 0; i < mask_table.size(); ++i) {
             write_mask |= mask[i] ? mask_table[i] : 0;
         }
-        // A target the fragment shader never writes gets undefined values in Vulkan; AMD's
-        // drivers store garbage (dark outlines around Ocarina's castle from a depth-test pass).
-        if (index >= fragment_writes_color.size() || !fragment_writes_color[index]) {
-            write_mask = 0;
-        }
+        write_mask &= ColorOutputMask(index);
         cb_attachments.push_back({
             .blendEnable = blend.enable != 0,
             .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
@@ -1237,24 +1240,26 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         if (!spv_modules[stage]) {
             continue;
         }
-        auto& stage_ci =
-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = nullptr,
-                .flags = 0,
-                .stage = StageFlag(stage_infos[stage],
-                                   MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
-                .module = *spv_modules[stage],
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
-            });
         const Shader::Info& info{stage_infos[stage]};
+        const VkShaderStageFlagBits stage_flag{
+            StageFlag(info, MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
+        // Votes, ballots and shuffles span the guest's 32-thread warp. A driver free to pick a
+        // narrower or wider subgroup (Intel runs mesh shaders SIMD16, AMD runs 64 wide) splits
+        // the warp and breaks them.
         const bool uses_warp_ops = info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
                                    info.uses_quad_shuffles || info.uses_fswzadd;
-        if (uses_warp_ops && device.NeedsGraphicsSubgroupShuffleWorkaround(stage_ci.stage)) {
-            stage_ci.pNext = &subgroup_size_ci;
-        }
+        const bool force_warp_size = uses_warp_ops && device.IsExtSubgroupSizeControlSupported() &&
+                                     device.IsGuestWarpSizeSupported(stage_flag);
+        shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .pNext = force_warp_size ? &subgroup_size_ci : nullptr,
+            .flags = 0,
+            .stage = stage_flag,
+            .module = *spv_modules[stage],
+            .pName = "main",
+            .pSpecializationInfo = nullptr,
+        });
     }
     VkPipelineCreateFlags flags{};
     if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
@@ -1303,6 +1308,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
     }
     const PipelineCompileLog compile_log{unoptimized ? "graphics (unoptimized)" : "graphics",
                                          std::move(compile_shaders)};
+    const auto trace_begin = std::chrono::steady_clock::now();
+    TracePipelineBuild("BEGIN", "graphics", key.Hash(), key.unique_hashes, unoptimized);
     pipeline = device.GetLogical().CreateGraphicsPipeline({
         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
         .pNext = nullptr,
@@ -1324,6 +1331,10 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .basePipelineHandle = nullptr,
         .basePipelineIndex = 0,
     }, *pipeline_cache);
+    TracePipelineBuild("END", "graphics", key.Hash(), key.unique_hashes, unoptimized,
+                       std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - trace_begin)
+                           .count());
 
     // Log graphics pipeline creation
     if (GPU::Logging::IsActive()) {

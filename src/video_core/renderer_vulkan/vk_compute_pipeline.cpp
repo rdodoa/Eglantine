@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <vector>
@@ -13,6 +15,7 @@
 #include <boost/container/small_vector.hpp>
 #include <fmt/format.h>
 
+#include "video_core/renderer_vulkan/pipeline_build_trace.h"
 #include "video_core/renderer_vulkan/pipeline_helper.h"
 #include "video_core/renderer_vulkan/pipeline_optimization.h"
 #include "video_core/renderer_vulkan/pipeline_statistics.h"
@@ -290,7 +293,15 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
         };
         try {
             const PipelineCompileLog compile_log{"compute", fmt::format("s6:{:016x}", shader_hash)};
+            const std::array<u64, 1> traced{shader_hash};
+            const bool unoptimized = (flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) != 0;
+            const auto trace_begin = std::chrono::steady_clock::now();
+            TracePipelineBuild("BEGIN", "compute", shader_hash, traced, unoptimized);
             pipeline = device.GetLogical().CreateComputePipeline(compute_ci, *pipeline_cache);
+            TracePipelineBuild("END", "compute", shader_hash, traced, unoptimized,
+                               std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - trace_begin)
+                                   .count());
         } catch (const vk::Exception& exception) {
             LOG_CRITICAL(Render_Vulkan, "Adreno rejected compute shader {:016X}: {}", shader_hash,
                          exception.what());
@@ -325,7 +336,12 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     }};
     build_task = std::move(func);
     if (thread_worker) {
-        thread_worker->QueueWork([this] { RunBuild(); });
+        build_task_done = false;
+        thread_worker->QueueWork([this] {
+            RunBuild();
+            // The last access to this pipeline from the worker.
+            build_task_done.store(true, std::memory_order::release);
+        });
     } else {
         RunBuild();
     }
@@ -378,7 +394,8 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                                        1) != 0
                                                   ? cbufs[cbuf].Address()
                                                   : GPUVAddr{};
-                                   }),
+                                   },
+                                   device.GetStorageBufferAlignment()),
                                via_header_index);
         }
         ASSERT(((qmd.const_buffer_enable_mask >> desc.cbuf_index) & 1) != 0);
