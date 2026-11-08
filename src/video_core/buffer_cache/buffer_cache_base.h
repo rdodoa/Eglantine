@@ -471,6 +471,9 @@ public:
 
     [[nodiscard]] std::pair<Buffer*, u32> GetDrawIndirectBuffer();
 
+    /// Fast draw verify (nx2_fast_draw.h): a hash of the bindings a delta draw keeps.
+    [[nodiscard]] u64 KeptGraphicsBindingsHash(bool vertex, bool storage, bool texture) const;
+
     template <typename Func>
     void BufferOperations(Func&& func) {
         do {
@@ -485,7 +488,7 @@ public:
     /// Indirectly read banks of native programs already uploaded this frame.
     std::unordered_set<DAddr> native_indirect_uniforms_this_frame;
 
-    /// EDEN_NX2_DRAW_TUNING=0 turns off the two per-draw shortcuts below.
+    /// EDEN_NX2_DRAW_TUNING=0 turns off the per-draw shortcut below.
     static bool Nx2DrawTuning() {
         static const bool enabled = [] {
             const char* value = std::getenv("EDEN_NX2_DRAW_TUNING");
@@ -493,15 +496,6 @@ public:
         }();
         return enabled;
     }
-    /// Each vertex buffer slot as last synchronized: skipped while none of its pages became CPU
-    /// modified since (MemoryTrackerBase::CpuWriteEpoch).
-    struct Nx2SyncedVertexBuffer {
-        BufferId buffer_id{};
-        DAddr device_addr{};
-        u32 size{};
-        u64 epoch{~u64{0}};
-    };
-    std::array<Nx2SyncedVertexBuffer, NUM_VERTEX_BUFFERS> nx2_synced_vertex_buffers{};
     /// Ranges recently added to a range set: adding one again before the set lost any range is a
     /// no-op (Bananza's culling draws mark the same storage ranges written draw after draw).
     struct Nx2RecentRange {
@@ -645,6 +639,9 @@ private:
 
     bool SynchronizeBuffer(Buffer& buffer, DAddr device_addr, u32 size);
 
+    /// SynchronizeBuffer for vertex buffer slots 0-31 and the index buffer (slot 32).
+    void SynchronizeGeometryBuffer(u32 slot, BufferId buffer_id, DAddr device_addr, u32 size);
+
     void UploadMemory(Buffer& buffer, u64 total_size_bytes, u64 largest_copy,
                       std::span<BufferCopy> copies);
 
@@ -715,6 +712,22 @@ private:
     u32 stale_vertex_buffers_mask = 0;
     u64 vertex_buffers_serial = 0;
     std::array<Binding, 32> v_buffer{};
+
+    /// The range each geometry slot last scanned for uploads (SynchronizeGeometryBuffer).
+    struct GeometrySync {
+        BufferId buffer_id{};
+        DAddr device_addr{};
+        u32 size{};
+        u64 deletions{};
+    };
+    std::array<GeometrySync, NUM_VERTEX_BUFFERS + 1> geometry_syncs{};
+    /// Counts DeleteBuffer calls: a buffer id older than this count may have been freed or reused.
+    u64 buffer_deletions = 0;
+    struct GeometryStats {
+        u64 syncs{};
+        u64 syncs_skipped{};
+        u64 verify_mismatches{};
+    } geometry_stats;
 
     boost::container::small_vector<BufferCopy, 4> upload_copies;
 
