@@ -95,8 +95,6 @@ EDEN_NX2_OOT_EXPOSURE_SCALE=0.75
 EDEN_NX2_OOT_BLOOM_EXP_SCALE=1.2
 
 # --- Opt-in, continued ---
-# Lichii (zortos293) "K4": report GPU time divided by N to Ampere games (Ocarina's dynamic resolution)
-#EDEN_NX2_GPU_TIME_DIV=4
 # Lichii (zortos293) prototype: record render passes in parallel
 #EDEN_NX2_PARALLEL_RECORD=1
 

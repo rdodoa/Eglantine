@@ -8,7 +8,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
 #include <list>
 #include <memory>
 #include <utility>
@@ -44,21 +43,6 @@
 #include "video_core/shader_notify.h"
 
 namespace Tegra {
-
-namespace {
-u64 GpuTimeDivisor() {
-    static const u64 divisor = [] {
-        const char* value = std::getenv("EDEN_NX2_GPU_TIME_DIV");
-        const u64 parsed = value ? std::strtoull(value, nullptr, 10) : 1;
-        if (parsed > 1) {
-            LOG_INFO(HW_GPU, "EDEN_NX2_GPU_TIME_DIV: GPU durations since each present / {}",
-                     parsed);
-        }
-        return parsed;
-    }();
-    return divisor;
-}
-} // Anonymous namespace
 
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
@@ -186,19 +170,16 @@ struct GPU::Impl {
     }
 
     [[nodiscard]] u64 GetTicks() const {
-        const bool ampere = g_nx2_ampere.load(std::memory_order_relaxed);
-        const u64 ticks =
-            ReadGpuTimestamp(system.CoreTiming(), ampere, Settings::values.gpu_clock.GetValue());
-        if (!ampere) {
-            return ticks;
-        }
-        return DivideSinceAnchor(ticks, gpu_time_anchor.load(std::memory_order_relaxed),
-                                 GpuTimeDivisor());
+        return ReadGpuTimestamp(system.CoreTiming(), g_nx2_ampere.load(std::memory_order_relaxed),
+                                Settings::values.gpu_clock.GetValue(),
+                                ampere_anchor.load(std::memory_order_relaxed));
     }
 
     void RendererFrameEndNotify() {
-        gpu_time_anchor.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
-                              std::memory_order_relaxed);
+        ampere_anchor.store(
+            AmpereAnchor::At(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
+                             Settings::values.gpu_clock.GetValue()),
+            std::memory_order_relaxed);
         system.GetPerfStats().EndGameFrame();
     }
 
@@ -396,7 +377,7 @@ struct GPU::Impl {
 
     std::list<std::function<void()>> sync_requests;
     std::atomic<u64> current_sync_fence{};
-    std::atomic<u64> gpu_time_anchor{};
+    std::atomic<AmpereAnchor> ampere_anchor{};
     u64 last_sync_fence{};
 
     VideoCommon::PendingMaps pending_maps;
