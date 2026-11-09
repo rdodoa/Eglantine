@@ -58,13 +58,14 @@ namespace VkDeviceInfo {
 class Record {
 public:
     explicit Record(std::string_view name, const std::vector<VkPresentModeKHR>& vsync_modes,
-                    bool has_broken_compute, u64 device_local_memory);
+                    bool has_broken_compute, u64 device_local_memory, bool fsr4_capable);
     ~Record();
 
     const std::string name;
     const std::vector<VkPresentModeKHR> vsync_support;
     const bool has_broken_compute;
     const u64 device_local_memory; ///< Bytes of memory the device can use, 0 if unknown
+    const bool fsr4_capable; ///< VideoCommon::IsFsr4CapableGpu
 };
 
 // TODO(crueter): Port some configure_graphics.cpp stuff

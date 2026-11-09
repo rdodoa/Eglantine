@@ -96,5 +96,3 @@ EDEN_NX2_OOT_BLOOM_EXP_SCALE=1.2
 #EDEN_NX2_AMD_SAFE_COMPILE=1
 # Every graphics pipeline unoptimized on AMD's Windows driver (crash near the Deku Tree)
 #EDEN_NX2_AMD_SAFE_COMPILE_GRAPHICS=1
-# Frizti: no wait before reading command lists on pages the GPU never wrote (experiment)
-#EDEN_NX2_LIST_WAIT_SKIP=1
