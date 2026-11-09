@@ -45,10 +45,6 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_KEEP_ASTC=1
 
 # --- Hortensia: optimizations ported from other forks (on by default; uncomment a line to undo it) ---
-# Selevet: semaphore acquires already met in memory don't drain the GPU thread (off in DK Bananza)
-#EDEN_NX2_ACQUIRE_PEEK=0
-# Selevet: acquires met by a release still queued for the GPU thread don't drain
-#EDEN_NX2_ACQUIRE_QUEUED=0
 # Selevet: SEM_EXECUTE acquires release fences on the back thread instead of draining
 #EDEN_NX2_SEMEXEC_DRAIN=1
 # Selevet: poll the host GPU up to 300 us before sleeping in the driver
@@ -61,13 +57,9 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_DRAW_TUNING=0
 # Eglantine-DKB: skip draws with no vertices or no instances
 #EDEN_NX2_DRAW_EMPTY=1
-# Eglantine-DKB (DK Bananza only): macro DMA reads of untouched pages skip the full drain
-#EDEN_NX2_DMA_DRAIN=1
 # Skip Switch 2 draws while their pipeline builds instead of stopping the game to wait for it (with
 # asynchronous shaders on; an effect can be missing for a moment). =0 waits for every build.
 EDEN_NX2_ASYNC_SKIP=1
-# Selevet: the timer thread sleeps through long waits (frees most of a CPU core on 6-core CPUs)
-#EDEN_TIMING_COARSE=0
 # Selevet: wake the timer thread only for a new earliest event (Donkey Kong Bananza)
 #EDEN_TIMING_WAKE_ALL=1
 # Orchid: Switch 2 graphics services run on their own host thread instead of emulated core 3
