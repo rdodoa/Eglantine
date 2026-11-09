@@ -444,6 +444,7 @@ GraphicsPipeline* RasterizerVulkan::TakeReusableDraw(bool is_indexed, bool is_in
     namespace FastDraw = VideoCommon::Nx2FastDraw;
     const ReusableDraw draw = std::exchange(reusable_draw, ReusableDraw{});
     const FastDraw::Delta delta = std::exchange(FastDraw::g_delta, FastDraw::Delta{});
+    taken_delta = delta;
     const auto full = [&](FullDraw reason) -> GraphicsPipeline* {
         ++fast_draw_stats.full[static_cast<size_t>(reason)];
         return nullptr;
@@ -1023,6 +1024,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     const bool delta_holds =
         delta_pipeline != nullptr && DeltaStillHolds(draw_serial, draw_map_serial);
     const DrawPath path = delta_holds && !verify_pipeline ? DrawPath::Delta : DrawPath::Full;
+    buffer_cache.BeginGraphicsUniforms(path == DrawPath::Delta ? &taken_delta : nullptr);
     if (path == DrawPath::Delta) {
         if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->ConfigureDelta(is_indexed)) {
             report_failure("configure failed");
@@ -1108,6 +1110,7 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         draw_func();
     }
     submitted = true;
+    buffer_cache.NoteWorkRecorded(false);
 #ifdef EGLANTINE_STREAMLINE
     constexpr u64 final_vertex = 0x16aff33d999f993fULL;
     constexpr u64 final_fragment = 0x52402d8e8ab55263ULL;
@@ -2269,6 +2272,7 @@ void RasterizerVulkan::DispatchCompute() {
                 cmdbuf.DispatchIndirect(indirect_buffer, indirect_offset);
             });
         });
+        buffer_cache.NoteWorkRecorded(true);
         SubmitNx2ListCopies();
         publish_collision_map();
         return;
@@ -2323,6 +2327,7 @@ void RasterizerVulkan::DispatchCompute() {
         // The deferred native binding may follow DLSS's command buffer bindings.
         scheduler.InvalidateState();
     }
+    buffer_cache.NoteWorkRecorded(true);
     SubmitNx2ListCopies();
     publish_collision_map();
 
@@ -2444,6 +2449,38 @@ void RasterizerVulkan::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType 
     }
 }
 
+void RasterizerVulkan::FlushRegionForRead(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    // As FlushRegion, but the buffer cache doesn't wait for the host GPU here (Scheduler::Finish,
+    // with its lock held): the reading thread does, in FinishRead.
+    gpu.InvalidateGPUCache();
+    {
+        std::scoped_lock lock{texture_cache.mutex};
+        texture_cache.DownloadMemory(addr, size);
+    }
+    {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.DownloadMemoryForRead(addr, size);
+    }
+    query_cache.FlushRegion(addr, size);
+}
+
+void RasterizerVulkan::FinishRead(DAddr addr, u64 size) {
+    buffer_cache.FinishReadDownloads(addr, size);
+}
+
+bool RasterizerVulkan::NoteReportPending(DAddr addr, u64 size) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.NoteReportPending(addr, size);
+}
+
+void RasterizerVulkan::FinishReport(DAddr addr, u64 size) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    buffer_cache.FinishReport(addr, size);
+}
+
 bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     // The split's front asks this before each macro DMA read, and the back holds the buffer
     // cache's lock through each draw: pages the GPU never wrote need no look under it.
@@ -2467,6 +2504,10 @@ bool RasterizerVulkan::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 
 bool RasterizerVulkan::HasPendingQueries(DAddr addr, u64 size) {
     return query_cache.IsRegionGpuModified(addr, size);
+}
+
+bool RasterizerVulkan::HoldsQueries(DAddr addr, u64 size) {
+    return query_cache.HoldsQueries(addr, size);
 }
 
 VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64 size) {
@@ -2504,7 +2545,9 @@ void RasterizerVulkan::PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::Cac
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex};
-    buffer_cache.ClearDownload(addr, size);
+    // MemoryManager landed the read downloads here just before (FinishRead) and writes guest memory
+    // next. Landing a newer one would wait for the host GPU with the lock held, from any thread.
+    buffer_cache.ClearReplacedDownload(addr, size);
 }
 
 void RasterizerVulkan::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {

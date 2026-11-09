@@ -120,7 +120,10 @@ add_library(video_core STATIC
     nx2_fast_draw.cpp
     nx2_fast_draw.h
     nx2_profile.h
+    nx2_stutter_trace.cpp
+    nx2_stutter_trace.h
     nx2_perf.h
+    nx2_async_readback.h
     nx2_download_trace.h
     pending_maps.h
     present.h
