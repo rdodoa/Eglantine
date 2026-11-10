@@ -179,6 +179,8 @@ add_library(video_core STATIC
     renderer_vulkan/maxwell_to_vk.cpp
     renderer_vulkan/maxwell_to_vk.h
     renderer_vulkan/pipeline_build.h
+    renderer_vulkan/pipeline_build_failure.cpp
+    renderer_vulkan/pipeline_build_failure.h
     renderer_vulkan/pipeline_build_trace.h
     renderer_vulkan/pipeline_helper.h
     renderer_vulkan/pipeline_optimization.h
@@ -306,6 +308,7 @@ add_library(video_core STATIC
     shader_cache_v2/records.h
     shader_environment.cpp
     shader_environment.h
+    evicted_pointer_slots.h
     shader_handle_program.h
     shader_jobs.cpp
     shader_jobs.h
