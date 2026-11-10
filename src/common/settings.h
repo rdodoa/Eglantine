@@ -1046,6 +1046,12 @@ struct Values {
                                         Category::Miscellaneous};
     Setting<bool> hortensia_smart_presets_asked{linkage, false, "hortensia_smart_presets_asked",
                                               Category::Miscellaneous};
+    // The recommended settings offer (common/recommended_settings.h): whether the user has
+    // answered it, and the values its settings held before they were applied.
+    Setting<bool> recommended_settings_prompt_shown{
+        linkage, false, "recommended_settings_prompt_shown", Category::Miscellaneous};
+    Setting<std::string> recommended_settings_backup{
+        linkage, {}, "recommended_settings_backup", Category::Miscellaneous};
 
     // Network
     Setting<std::string> network_interface{linkage, std::string(), "network_interface",
