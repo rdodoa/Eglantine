@@ -191,6 +191,11 @@ public:
         return frame_gen_fps;
     }
 
+    /// What NVIDIA DLSS ran as since the last status bar update, empty when it didn't run
+    [[nodiscard]] const QString& DlssStatusText() const {
+        return dlss_status_text;
+    }
+
 signals:
 
     /**
@@ -554,6 +559,7 @@ private:
     QLabel* display_fps_label = nullptr;
     u64 display_frames_seen{};
     std::chrono::steady_clock::time_point display_frames_time{};
+    QLabel* dlss_status_label = nullptr;
     QLabel* emu_frametime_label = nullptr;
     QLabel* tas_label = nullptr;
     QLabel* firmware_label = nullptr;
@@ -567,6 +573,8 @@ private:
     QPushButton* frame_gen_status_button = nullptr;
     VideoCore::FrameGenState frame_gen_state{};
     u64 frame_gen_frames = 0;
+    u64 dlss_evaluations = 0;
+    QString dlss_status_text;
     bool frame_gen_generating = false;
     double frame_gen_fps = 0.0;
     QElapsedTimer frame_gen_fps_timer;
