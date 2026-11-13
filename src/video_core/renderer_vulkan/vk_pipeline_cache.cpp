@@ -1504,9 +1504,8 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             ++skipped_pipelines;
             continue;
         }
-        const bool used = PreloadAllPipelines() ||
-                          (used_pipelines.empty() ? queued_graphics < MaxPipelinesWithoutUsedList
-                                                  : used_pipelines.contains(hash));
+        const bool used = used_pipelines.empty() ? queued_graphics < MaxPipelinesWithoutUsedList
+                                                 : used_pipelines.contains(hash);
         const bool spare = !used && build_all && queued_spare < spare_pipelines;
         if (used || spare) {
             queued_spare += spare ? 1 : 0;
@@ -2183,12 +2182,6 @@ void PipelineCache::EvictUnusedPipelines() {
     // Building a pipeline again on MoltenVK means a Metal compile mid-game, far dearer than the
     // rebuild cost below, so none are evicted there.
     if (device.IsMoltenVK() || frame_count <= EvictAfterFrames) {
-        return;
-    }
-    // EDEN_NX2_PRELOAD_ALL_PIPELINES asked for every cached pipeline built: evicting the ones not
-    // used yet threw the preload away after 9000 frames (Ocarina: 22,510 of 24,285, then rebuilt
-    // one by one in new places).
-    if (PreloadAllPipelines()) {
         return;
     }
     // An evicted pipeline used again is translated again on the GPU thread (~8.5 ms) and built
