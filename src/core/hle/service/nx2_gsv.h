@@ -2680,11 +2680,6 @@ private:
         }
         const u64 shown = (u64{layout.width} << 48) | (u64{layout.height} << 32) |
                           (u64{crop_width} << 16) | crop_height;
-        if (image_format != 1 && image_format != 4 && image_format != m_unknown_format) {
-            m_unknown_format = image_format;
-            LOG_WARNING(Service, "nx2:vi2 present: image {} has unknown format {}, shown as RGBA8",
-                        image_id, image_format);
-        }
         if (shown != m_shown_layout) {
             m_shown_layout = shown;
             LOG_INFO(Service,
@@ -3127,7 +3122,6 @@ private:
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
     u64 m_shown_layout{}; // image and crop size last logged
-    u32 m_unknown_format{1}; // last unknown present format logged
     u64 m_logged_hdr_output{~u64{}}; // HDR status last logged
     u64 m_hdr_generation{};           // DisplayHdrMonitor generation NotifyHdrChange last saw
     u32 m_hdr_change_slots{};         // native event slots bound to HDR status / paper white
