@@ -5,11 +5,13 @@
 #include <string>
 #include <string_view>
 
+#include "common/common_types.h"
 #include "common/settings.h"
 
 namespace Settings {
 
 inline constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
+inline constexpr u64 HyruleWarriorsProgramId = 0x04003F40232DE000ULL;
 
 inline void SetMarioKartWorldRecommendedSettings(Values& settings, bool global) {
     const auto session = [global](auto& setting, auto value) {
@@ -27,14 +29,6 @@ inline void SetMarioKartWorldRecommendedSettings(Values& settings, bool global) 
     session(settings.use_docked_mode, ConsoleMode::Handheld);
     session(settings.scaling_filter, ScalingFilter::Bilinear);
     session(settings.anti_aliasing, AntiAliasing::Fxaa);
-}
-
-inline bool ApplyMarioKartWorldPreset(Values& settings, u64 program_id, bool accepted) {
-    if (!accepted || program_id != MarioKartWorldProgramId) {
-        return false;
-    }
-    SetMarioKartWorldRecommendedSettings(settings, false);
-    return true;
 }
 
 // ---- Hortensia smart presets ----------------------------------------------------------------

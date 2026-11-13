@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -71,6 +70,18 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
     BuiltinPatchRecord{0x805BD0, MAX_RESOLUTION_BRANCH, MAX_RESOLUTION_ORIGINAL},
 };
 
+// RsMan-Dev's texture pool patch: stp x8, x9, [sp, #0x10] stores the graphics allocator's
+// initial pool size (x8); the call doubles it first (lsl x8, x8, #1 ; stp ; ret).
+constexpr std::array<u8, 4> TEXTURE_POOL_ORIGINAL{0xE8, 0x27, 0x01, 0xA9};
+constexpr std::array<u8, 4> TEXTURE_POOL_CALL{0xD5, 0x6F, 0xC0, 0x94};
+constexpr std::array<u8, 12> TEXTURE_POOL_ROUTINE{
+    0x08, 0xF9, 0x7F, 0xD3, 0xE8, 0x27, 0x01, 0xA9, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array TEXTURE_POOL_RECORDS{
+    BuiltinPatchRecord{0xC2A36C, TEXTURE_POOL_CALL, TEXTURE_POOL_ORIGINAL},
+    BuiltinPatchRecord{0x3C462C0, TEXTURE_POOL_ROUTINE, {}, true},
+};
+
 constexpr std::array<u8, 4> DYNAMIC_FPS_ORIGINAL{0x28, 0x18, 0x20, 0x1E};
 constexpr std::array<u8, 4> DYNAMIC_FPS_CALL{0x4F, 0x7D, 0xD5, 0x94};
 // Dark's routine up to the step computation; the two built-ins differ only in the tail.
@@ -113,6 +124,15 @@ constexpr std::array BUILTIN_PATCHES{
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = MAX_RESOLUTION_RECORDS,
+    },
+    // With Max Resolution the guard house outgrows the initial pool and dereferences a null
+    // allocation.
+    BuiltinPatch{
+        .name = "Texture Pool x2 (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = TEXTURE_POOL_RECORDS,
     },
     // Dark's routine with a tail that also lowers the step above 60 fps, so the game keeps real
     // speed at any frame rate limit (Settings frame_rate_limit).
@@ -249,7 +269,7 @@ std::string GetUpdateVersionStringFromSlot(const ContentProvider* provider, u64 
     NACP nacp{nacp_file};
     return nacp.GetVersionString();
 }
-YUZU_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
+LICHII_NO_INLINE std::optional<u64> GetParentApplicationId(const ContentProvider* provider, u64 title_id) {
     return provider == nullptr ? std::nullopt : provider->GetParentApplicationId(title_id);
 }
 } // Anonymous namespace
@@ -287,7 +307,7 @@ std::vector<std::string> PatchManager::GetDisabledAddons() const {
     return disabled;
 }
 
-VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
+VirtualDir PatchManager::PatchExeFS(VirtualDir exefs, bool apply_update) const {
     LOG_INFO(Loader, "Patching ExeFS for title_id={:016X}", title_id);
 
     if (exefs == nullptr)
@@ -415,9 +435,17 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
     }
 
     if (!update_disabled && update != nullptr && update->GetExeFS() != nullptr) {
-        LOG_INFO(Loader, "    ExeFS: Update ({}) applied successfully",
-                 FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0)));
-        exefs = update->GetExeFS();
+        const auto version =
+            FormatTitleVersion(content_provider.GetEntryVersion(update_tid).value_or(0));
+        if (apply_update) {
+            LOG_INFO(Loader, "    ExeFS: Update ({}) applied successfully", version);
+            exefs = update->GetExeFS();
+        } else {
+            LOG_WARNING(Loader,
+                        "    ExeFS: Ignoring installed update ({}) for {:016X}: the container "
+                        "carries its own program and RomFS",
+                        version, title_id);
+        }
     }
 
     // LayeredExeFS
@@ -443,8 +471,10 @@ VirtualDir PatchManager::PatchExeFS(VirtualDir exefs) const {
             continue;
 
         auto exefs_dir = FindSubdirectoryCaseless(subdir, "exefs");
-        if (exefs_dir != nullptr)
+        if (exefs_dir != nullptr) {
+            LOG_INFO(Loader, "    ExeFS: LayeredExeFS mod {} (exefs)", subdir->GetName());
             layers.push_back(std::move(exefs_dir));
+        }
     }
     layers.push_back(exefs);
 
@@ -754,6 +784,7 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
 
     std::vector<VirtualDir> layers;
     std::vector<VirtualDir> layers_ext;
+    std::vector<std::string> mods;
     layers.reserve(patch_dirs.size() + 1);
     layers_ext.reserve(patch_dirs.size() + 1);
     for (const auto& subdir : patch_dirs) {
@@ -761,23 +792,20 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
             continue;
         }
 
-        auto romfs_dir = FindSubdirectoryCaseless(subdir, "romfs");
-        if (romfs_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfs_dir)));
-
+        const auto layer = [&](std::vector<VirtualDir>& out, std::string_view kind) {
+            auto dir = FindSubdirectoryCaseless(subdir, kind);
+            if (dir == nullptr) {
+                return;
+            }
+            out.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(dir)));
+            mods.push_back(fmt::format("{} ({})", subdir->GetName(), kind));
+        };
+        layer(layers, "romfs");
         // Support for romfslite introduced in Atmosphere 1.9.5
-        auto romfslite_dir = FindSubdirectoryCaseless(subdir, "romfslite");
-        if (romfslite_dir != nullptr)
-            layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(romfslite_dir)));
-
-        auto ext_dir = FindSubdirectoryCaseless(subdir, "romfs_ext");
-        if (ext_dir != nullptr)
-            layers_ext.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(ext_dir)));
-
+        layer(layers, "romfslite");
+        layer(layers_ext, "romfs_ext");
         if (type == ContentRecordType::HtmlDocument) {
-            auto manual_dir = FindSubdirectoryCaseless(subdir, "manual_html");
-            if (manual_dir != nullptr)
-                layers.emplace_back(std::make_shared<CachedVfsDirectory>(std::move(manual_dir)));
+            layer(layers, "manual_html");
         }
     }
 
@@ -805,6 +833,9 @@ void PatchManager::ApplyLayeredFS(VirtualFile& romfs, ContentRecordType type) co
     }
 
     LOG_INFO(Loader, "    RomFS: LayeredFS patches applied successfully");
+    for (const auto& mod : mods) {
+        LOG_INFO(Loader, "    RomFS: LayeredFS mod {}", mod);
+    }
     romfs = std::move(packed);
 }
 
@@ -1358,7 +1389,10 @@ PatchManager::Metadata PatchManager::ParseControlNCA(const NCA& nca) const {
         return {};
     }
 
-    const auto romfs = PatchRomFS(&nca, base_romfs, ContentRecordType::Control);
+    return ParseControlRomFS(PatchRomFS(&nca, base_romfs, ContentRecordType::Control));
+}
+
+PatchManager::Metadata PatchManager::ParseControlRomFS(const VirtualFile& romfs) {
     if (romfs == nullptr) {
         return {};
     }
