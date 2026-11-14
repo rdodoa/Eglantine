@@ -64,8 +64,6 @@ EDEN_NX2_ASYNC_SKIP=1
 #EDEN_TIMING_WAKE_ALL=1
 # Orchid: Switch 2 graphics services run on their own host thread instead of emulated core 3
 #EDEN_NX2_GSV_HOST_THREAD=0
-# Orchid / Selevet: honour a swap interval above 1 only after N presents (Mario Kart World: 120)
-#EDEN_NX2_SWAP_STABLE=0
 # SmileyTatsu: Switch 2 pipelines are all built at boot and never evicted (less stutter in game)
 # notsapinho: storage reads of Switch 2 games are not paced (faster loading, Pokopia boots ~13 s faster)
 
