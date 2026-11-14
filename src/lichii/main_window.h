@@ -53,6 +53,7 @@ class GImageInfo;
 class GRenderWindow;
 class LoadingScreen;
 class OverlayDialog;
+class BugReportDialog;
 class ControllerDialog;
 class QLabel;
 class MultiplayerState;
@@ -455,6 +456,7 @@ private slots:
     void OnCreateHomeMenuDesktopShortcut();
     void OnCreateHomeMenuApplicationMenuShortcut();
     void OnCaptureScreenshot();
+    void OnReportBug();
     /// Checks for decryption keys; `prompt` asks to install them when they are missing.
     void OnCheckFirmwareDecryption(bool prompt = true);
 #ifdef __unix__
@@ -540,6 +542,16 @@ private:
 
     MultiplayerState* multiplayer_state = nullptr;
     QAction* hortensia_smart_presets_action = nullptr;
+    void RememberSpeedLimitBeforeHotkey();
+    void UndoSessionSpeedChanges();
+    /// The speed limit before the session's first Toggle Framerate Limit / turbo / slow hotkey,
+    /// and whether it was the global or the per-game value. Undone when the game stops, so the
+    /// hotkeys only last for the session; a change made in the configuration dialogs is kept.
+    struct SessionSpeedLimit {
+        bool value;
+        bool using_global;
+    };
+    std::optional<SessionSpeedLimit> speed_limit_before_hotkeys;
 
     GRenderWindow* render_window = nullptr;
     GameList* game_list = nullptr;
@@ -551,6 +563,7 @@ private:
     QTimer nextendo_session_timer;
     QFutureWatcher<bool> nextendo_session_watcher;
     OverlayDialog* shutdown_dialog{};
+    BugReportDialog* bug_report_dialog{};
     PerformanceOverlay* perf_overlay = nullptr;
 #ifdef HAS_RESHADE
     ConfigurePostProcessing* post_processing_dialog = nullptr;

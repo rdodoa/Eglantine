@@ -51,6 +51,7 @@
 #include "lichii/recommended_settings_dialog.h"
 #include "lichii/shader_warm_dialog.h"
 #include "lichii/whats_new_dialog.h"
+#include "lichii/bug_report_dialog.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
 #ifdef LICHII_NX_TOOLS
 #include "core/file_sys/registered_cache.h"
@@ -124,6 +125,7 @@
 
 #include "qt_common/util/content.h"
 #include "qt_common/util/fs.h"
+#include "qt_common/util/game.h"
 #include "qt_common/util/meta.h"
 #include "qt_common/util/mod.h"
 #include "qt_common/util/path.h"
@@ -1146,6 +1148,7 @@ void MainWindow::InitializeWidgets() {
 
     volume_button = new VolumeButton();
     volume_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    volume_button->setProperty("chip", QStringLiteral("volume"));
     volume_button->setFocusPolicy(Qt::NoFocus);
     volume_button->setCheckable(true);
     UpdateVolumeUI();
@@ -1187,6 +1190,7 @@ void MainWindow::InitializeWidgets() {
 
     frame_gen_status_button = new QPushButton();
     frame_gen_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    frame_gen_status_button->setProperty("chip", QStringLiteral("fg"));
     frame_gen_status_button->setFocusPolicy(Qt::NoFocus);
     frame_gen_status_button->setCheckable(true);
     connect(frame_gen_status_button, &QPushButton::clicked, this, [this] {
@@ -1220,6 +1224,7 @@ void MainWindow::InitializeWidgets() {
 #ifdef HAS_RESHADE
     post_shader_status_button = new QPushButton();
     post_shader_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    post_shader_status_button->setProperty("chip", QStringLiteral("fx"));
     post_shader_status_button->setFocusPolicy(Qt::NoFocus);
     post_shader_status_button->setCheckable(true);
     connect(post_shader_status_button, &QPushButton::clicked, this, [this] {
@@ -1256,6 +1261,7 @@ void MainWindow::InitializeWidgets() {
     // setup AA button
     aa_status_button = new QPushButton();
     aa_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    aa_status_button->setProperty("chip", QStringLiteral("aa"));
     aa_status_button->setFocusPolicy(Qt::NoFocus);
     connect(aa_status_button, &QPushButton::clicked, [&] {
         auto aa_mode = Settings::values.anti_aliasing.GetValue();
@@ -1289,6 +1295,7 @@ void MainWindow::InitializeWidgets() {
     // Setup Filter button
     filter_status_button = new QPushButton();
     filter_status_button->setObjectName(QStringLiteral("TogglableStatusBarButton"));
+    filter_status_button->setProperty("chip", QStringLiteral("filter"));
     filter_status_button->setFocusPolicy(Qt::NoFocus);
     connect(filter_status_button, &QPushButton::clicked, this, &MainWindow::OnToggleAdaptingFilter);
     UpdateFilterText();
@@ -1314,6 +1321,7 @@ void MainWindow::InitializeWidgets() {
     // Setup Dock button
     dock_status_button = new QPushButton();
     dock_status_button->setObjectName(QStringLiteral("DockingStatusBarButton"));
+    dock_status_button->setProperty("chip", QStringLiteral("dock"));
     dock_status_button->setFocusPolicy(Qt::NoFocus);
     connect(dock_status_button, &QPushButton::clicked, this, &MainWindow::OnToggleDockedMode);
     dock_status_button->setCheckable(true);
@@ -1340,6 +1348,7 @@ void MainWindow::InitializeWidgets() {
     // Setup GPU Accuracy button
     gpu_accuracy_button = new QPushButton();
     gpu_accuracy_button->setObjectName(QStringLiteral("GPUStatusBarButton"));
+    gpu_accuracy_button->setProperty("chip", QStringLiteral("gpu"));
     gpu_accuracy_button->setCheckable(true);
     gpu_accuracy_button->setFocusPolicy(Qt::NoFocus);
     connect(gpu_accuracy_button, &QPushButton::clicked, this, &MainWindow::OnToggleGpuAccuracy);
@@ -1466,6 +1475,7 @@ void MainWindow::InitializeHotkeys() {
     hotkey_registry.LoadHotkeys();
 
     LinkActionShortcut(ui->action_Load_File, QStringLiteral("Load File"));
+    LinkActionShortcut(ui->action_Load_Amiibo, QStringLiteral("Load/Remove Amiibo"));
     LinkActionShortcut(ui->action_Exit, QStringLiteral("Exit Eglantine"));
     LinkActionShortcut(ui->action_Restart, QStringLiteral("Restart Emulation"));
     LinkActionShortcut(ui->action_Pause, QStringLiteral("Continue/Pause Emulation"));
@@ -1476,6 +1486,7 @@ void MainWindow::InitializeHotkeys() {
                        QStringLiteral("Toggle Performance Overlay"));
     LinkActionShortcut(ui->action_Fullscreen, QStringLiteral("Fullscreen"));
     LinkActionShortcut(ui->action_Capture_Screenshot, QStringLiteral("Capture Screenshot"));
+    LinkActionShortcut(ui->action_Report_Bug, QStringLiteral("Report a Bug"));
     LinkActionShortcut(ui->action_TAS_Start, QStringLiteral("TAS Start/Stop"), true);
     LinkActionShortcut(ui->action_TAS_Record, QStringLiteral("TAS Record"), true);
     LinkActionShortcut(ui->action_TAS_Reset, QStringLiteral("TAS Reset"), true);
@@ -1515,16 +1526,28 @@ void MainWindow::InitializeHotkeys() {
     connect_shortcut(QStringLiteral("Audio Volume Up"), &MainWindow::OnIncreaseVolume);
 
     connect_shortcut(QStringLiteral("Toggle Framerate Limit"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleStandardMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Turbo Speed"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleTurboMode();
         SetFPSSuffix();
     });
 
     connect_shortcut(QStringLiteral("Toggle Slow Speed"), [this] {
+        if (!emulation_running) {
+            return;
+        }
+        RememberSpeedLimitBeforeHotkey();
         Settings::ToggleSlowMode();
         SetFPSSuffix();
     });
@@ -1820,6 +1843,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_Desktop, &MainWindow::OnCreateHomeMenuDesktopShortcut);
     connect_menu(ui->action_Application_Menu, &MainWindow::OnCreateHomeMenuApplicationMenuShortcut);
     connect_menu(ui->action_Capture_Screenshot, &MainWindow::OnCaptureScreenshot);
+    connect_menu(ui->action_Report_Bug, &MainWindow::OnReportBug);
 
     // TAS
     connect_menu(ui->action_TAS_Start, &MainWindow::OnTasStartStop);
@@ -1942,6 +1966,7 @@ void MainWindow::UpdateMenuState() {
     }
 
     ui->action_Capture_Screenshot->setEnabled(emulation_running && !is_paused);
+    ui->action_Report_Bug->setEnabled(emulation_running && !is_paused);
 
     if (emulation_running && is_paused) {
         ui->action_Pause->setText(tr("&Continue"));
@@ -2318,6 +2343,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         }
     }
     PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
+    speed_limit_before_hotkeys.reset();
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -2543,6 +2569,10 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             std::filesystem::path{Common::U16StringFromBuffer(filename.utf16(), filename.size())}
                 .filename());
     }
+    // The name the user gave the game in Properties wins, as in the library.
+    if (auto custom_title = QtCommon::Game::ReadCustomTitle(title_id); !custom_title.empty()) {
+        title_name = std::move(custom_title);
+    }
     const bool is_64bit = QtCommon::system->Kernel().ApplicationProcess()->Is64Bit();
     const auto instruction_set_suffix = is_64bit ? tr("(64-bit)") : tr("(32-bit)");
     title_name = tr("%1 %2", "%1 is the title name. %2 indicates if the title is 64-bit or 32-bit")
@@ -2573,6 +2603,29 @@ void MainWindow::BootGameFromList(const QString& filename, StartGameType with_co
     BootGame(filename, ApplicationAppletParameters(), with_config);
 }
 
+void MainWindow::RememberSpeedLimitBeforeHotkey() {
+    if (!speed_limit_before_hotkeys) {
+        speed_limit_before_hotkeys = SessionSpeedLimit{
+            .value = Settings::values.use_speed_limit.GetValue(),
+            .using_global = Settings::values.use_speed_limit.UsingGlobal(),
+        };
+    }
+}
+
+void MainWindow::UndoSessionSpeedChanges() {
+    // Undo the session's frame rate limit hotkey and turbo/slow modes. Only what the hotkeys
+    // changed is put back, in the scope (global or per-game) it was changed in: forcing the
+    // limit on here saved "Limit Speed Percent" as checked after every game, whatever the user
+    // had chosen.
+    // A configuration applied in a dialog that is still open replaces the hotkeys' change too.
+    if (speed_limit_before_hotkeys && !UISettings::values.configuration_applied &&
+        Settings::values.use_speed_limit.UsingGlobal() == speed_limit_before_hotkeys->using_global) {
+        Settings::values.use_speed_limit.SetValue(speed_limit_before_hotkeys->value);
+    }
+    speed_limit_before_hotkeys.reset();
+    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+}
+
 bool MainWindow::OnShutdownBegin() {
     if (!emulation_running) {
         return false;
@@ -2584,9 +2637,7 @@ bool MainWindow::OnShutdownBegin() {
 
     AllowOSSleep();
 
-    // Disable unlimited frame rate and turbo/slow modes
-    Settings::values.use_speed_limit.SetValue(true);
-    Settings::values.current_speed_mode = Settings::SpeedMode::Standard;
+    UndoSessionSpeedChanges();
 
     if (QtCommon::system->IsShuttingDown()) {
         status_bar_update_timer.stop();
@@ -2695,6 +2746,10 @@ void MainWindow::OnEmulationStopped() {
     if (QtCommon::emu_thread && QtCommon::emu_thread->isRunning()) {
         return;
     }
+    if (bug_report_dialog) {
+        bug_report_dialog->StopCapture();
+    }
+    UndoSessionSpeedChanges();
     shutdown_timer.stop();
     emu_terminate_timer.stop();
     if (QtCommon::emu_thread) {
@@ -2788,6 +2843,9 @@ void MainWindow::ShutdownGame() {
         return;
     }
 
+    if (bug_report_dialog) {
+        bug_report_dialog->StopCapture();
+    }
     // TODO(crueter): make this common as well (frontend_common?)
     play_time_manager->Stop();
     OnShutdownBegin();
@@ -4057,7 +4115,10 @@ void MainWindow::OnConfigure() {
         // Runs if the user hit Cancel or closed the window, and did not ever press the Apply button
         // or `Reset to Defaults` button
         return;
-    } else if (result == QDialog::Accepted) {
+    }
+    // Applied settings (OK, Apply or Reset to Defaults) replace the speed limit the hotkeys changed.
+    speed_limit_before_hotkeys.reset();
+    if (result == QDialog::Accepted) {
         // Only apply new changes if user hit Okay
         // This is here to avoid applying changes if the user hit Apply, made some changes, then hit
         // Cancel
@@ -4341,13 +4402,33 @@ void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_
     Settings::SetConfiguringGlobal(false);
     ConfigurePerGame dialog(this, title_id, file_name, vk_device_records, *QtCommon::system);
     dialog.LoadFromFile(Core::GetGameFileFromPath(QtCommon::vfs, file_name));
+    // Artwork saved here wins over a SteamGridDB lookup still running for the game.
+    connect(&dialog, &ConfigurePerGame::CustomArtworkChanged, game_list,
+            &GameList::OnCustomArtworkChanged);
 
     const auto result = dialog.exec();
 
+    // A rename only changes the shown name: no rescan of the library.
+    if (const auto renamed = dialog.RenamedTitle()) {
+        game_list->SetGameTitle(title_id, *renamed);
+    }
+    // The running game shows the new name in the window title too, also when the custom name was
+    // removed from a game that has no name of its own to show in the library.
+    if (dialog.TitleChanged() && emulation_running && title_id != 0 &&
+        title_id == QtCommon::system->GetApplicationProcessProgramID()) {
+        OnApplicationChanged(title_id);
+    }
+
     if (result != QDialog::Accepted && !UISettings::values.configuration_applied) {
+        // Artwork saved before a failed save of the rest stays saved after Cancel: show it.
+        if (UISettings::values.is_game_list_reload_pending.exchange(false)) {
+            OnGameListRefresh();
+        }
         Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
         return;
-    } else if (result == QDialog::Accepted) {
+    }
+    speed_limit_before_hotkeys.reset();
+    if (result == QDialog::Accepted) {
         dialog.ApplyConfiguration();
     }
 
@@ -5272,6 +5353,16 @@ void MainWindow::OnCaptureScreenshot() {
     render_window->CaptureScreenshot(filename);
 }
 
+void MainWindow::OnReportBug() {
+    if (bug_report_dialog || QtCommon::emu_thread == nullptr || !QtCommon::emu_thread->IsRunning()) {
+        return;
+    }
+    BugReportDialog dialog(*QtCommon::system, this);
+    bug_report_dialog = &dialog;
+    dialog.exec();
+    bug_report_dialog = nullptr;
+}
+
 void MainWindow::KeepNextendoSessionAlive() {
     if (!Common::Nextendo::OnlinePlayActive() || nextendo_session_watcher.isRunning()) {
         return;
@@ -5336,11 +5427,22 @@ void MainWindow::OnApplicationChanged(u64 program_id) {
     std::string title_name;
     std::string title_version;
 
+    // The loader's name stays when the game has no control metadata (a NUP without an installed
+    // control record), as on boot.
+    if (QtCommon::system->GetGameName(title_name) != Loader::ResultStatus::Success) {
+        title_name.clear();
+    }
+
     const FileSys::PatchManager pm(program_id, QtCommon::system->GetFileSystemController(),
                                    QtCommon::system->GetContentProvider());
     if (const auto metadata = pm.GetControlMetadata(); metadata.first != nullptr) {
         title_version = metadata.first->GetVersionString();
-        title_name = metadata.first->GetApplicationName();
+        if (auto metadata_name = metadata.first->GetApplicationName(); !metadata_name.empty()) {
+            title_name = std::move(metadata_name);
+        }
+    }
+    if (auto custom_title = QtCommon::Game::ReadCustomTitle(program_id); !custom_title.empty()) {
+        title_name = std::move(custom_title);
     }
     if (title_name.empty()) {
         title_name = fmt::format("{:016X}", program_id);
