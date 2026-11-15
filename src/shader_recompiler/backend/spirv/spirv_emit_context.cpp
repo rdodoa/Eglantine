@@ -1092,8 +1092,16 @@ const EmitContext::GlobalMemoryFunctions& EmitContext::GlobalMemoryFunctionsOf(
 /// holding the address at run time.
 void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
     const Info& info{program.info};
-    global_memory_functions.resize(program.global_memory_routes.size() + 1);
-    global_memory_route = program.global_memory_route;
+    // NVIDIA's Linux driver hangs the GPU (Xid 109) in the Ocarina programs of #619 when their
+    // accesses select among their own candidate buffers, and runs them when every access selects
+    // among all bound buffers. The candidate routes exist for ANV's compile time (#1756), and
+    // select_global_memory_buffer is on for the NVIDIA proprietary driver only.
+    if (!profile.select_global_memory_buffer) {
+        global_memory_functions.resize(program.global_memory_routes.size() + 1);
+        global_memory_route = program.global_memory_route;
+    } else {
+        global_memory_functions.resize(1);
+    }
     if (!info.uses_global_memory || !profile.support_int64) {
         return;
     }

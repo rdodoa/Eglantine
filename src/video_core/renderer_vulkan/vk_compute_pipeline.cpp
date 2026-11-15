@@ -417,11 +417,7 @@ void ComputePipeline::RunBuild() {
 }
 
 bool ComputePipeline::CanReplaceOcarinaUpscale() const {
-    const bool known_shader =
-        shader_hash == OcarinaThreeQuarterShader || shader_hash == 0xef542df87cacfe9eULL ||
-        shader_hash == Ocarina1440pShader || shader_hash == Ocarina1440pScaledShader ||
-        shader_hash == Ocarina1440pScaledFieldShader || shader_hash == OcarinaFullSizeShader;
-    return known_shader && !info.stores_global_memory &&
+    return !info.stores_global_memory &&
            info.image_buffer_descriptors.empty() && info.image_descriptors.size() == 1 &&
            info.image_descriptors.front().count == 1 && info.image_descriptors.front().is_written &&
            !info.image_descriptors.front().is_read && !info.image_descriptors.front().is_byte_addressed &&

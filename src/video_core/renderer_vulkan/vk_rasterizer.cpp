@@ -2498,8 +2498,11 @@ void RasterizerVulkan::DispatchCompute() {
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     const auto list_slot = kepler_compute->GetIndirectListSlot();
     // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
-    const bool can_replace = OcarinaTemporalEnabled() && pipeline->CanReplaceOcarinaUpscale() &&
-                             (pipeline->ShaderHash() != ComputePipeline::OcarinaFullSizeShader ||
+    const auto oot_pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash());
+    const bool can_replace = OcarinaTemporalEnabled() &&
+                             oot_pass != VideoCommon::OcarinaUpscalePass::None &&
+                             pipeline->CanReplaceOcarinaUpscale() &&
+                             (oot_pass != VideoCommon::OcarinaUpscalePass::FullSize ||
                               oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
                              !indirect_address && !list_slot && !frame_dump.Capturing();
     // Until a dispatch overwrites the scene, each direct one binds only after the effects are
@@ -2605,7 +2608,7 @@ void RasterizerVulkan::DispatchCompute() {
         buffer_cache.NoteWorkRecorded(true);
         SubmitNx2ListCopies();
         publish_collision_map();
-        TryOcarinaUpscale(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, native_key, false);
         return;
     }
     if (indirect_address) {
@@ -2652,7 +2655,7 @@ void RasterizerVulkan::DispatchCompute() {
         }
     }
     const auto* const replacement =
-        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, true)
+        can_replace && !byte_addressed_shadow && TryOcarinaUpscale(*pipeline, native_key, true)
             ? oot_live_dlss.get()
             : nullptr;
     if (!replacement) {
@@ -2693,7 +2696,7 @@ void RasterizerVulkan::DispatchCompute() {
     publish_collision_map();
 
     if (!can_replace) {
-        TryOcarinaUpscale(*pipeline, false);
+        TryOcarinaUpscale(*pipeline, native_key, false);
     }
 
     // Log compute dispatch
@@ -3658,10 +3661,10 @@ void RasterizerVulkan::ReadOcarinaActor(OcarinaActorMesh& mesh) {
 }
 
 /// Track the scene depth on its reader dispatch, or try to replace a recognized upscale dispatch.
-bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool replace) {
-    constexpr u64 depth_reader = 0x1fc7a0423116281fULL;
-    const u64 upscale_hash = pipeline.ShaderHash();
-    if ((!replace && upscale_hash != depth_reader) || !OcarinaTemporalEnabled()) {
+bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 native_key,
+                                         bool replace) {
+    if ((!replace && native_key != VideoCommon::OcarinaDepthReaderKey) ||
+        !OcarinaTemporalEnabled()) {
         return false;
     }
     const bool native_resolution =
@@ -3747,17 +3750,16 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, bool r
     auto& target = texture_cache.GetImageView(written[0]);
     using VideoCore::Surface::PixelFormat;
     const auto extent = oot_motion.extent;
-    const bool native_size = upscale_hash == ComputePipeline::OcarinaFullSizeShader;
+    using enum VideoCommon::OcarinaUpscalePass;
+    const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline.ShaderHash());
+    const bool native_size = pass == FullSize;
     // At the DLSS Performance render scale (1920x1080) the game upscales to 2560x1440 with its
     // 3/4 pass instead (QuincyForbes' f7d0938b5b). The scale is the one the game started with,
     // whatever quality is chosen since.
-    const bool three_quarter_1440p = upscale_hash == ComputePipeline::OcarinaThreeQuarterShader &&
+    const bool three_quarter_1440p = pass == ThreeQuarter &&
                                      oot_performance_scale && target.size.width == 2560 &&
                                      target.size.height == 1440;
-    const bool pass_1440p = upscale_hash == ComputePipeline::Ocarina1440pShader ||
-                            upscale_hash == ComputePipeline::Ocarina1440pScaledShader ||
-                            upscale_hash == ComputePipeline::Ocarina1440pScaledFieldShader ||
-                            three_quarter_1440p;
+    const bool pass_1440p = pass == Pass1440p || three_quarter_1440p;
     const bool upscale_4k = pass_1440p && !native_resolution;
     // The 1440p pass takes any 16:9 scene up to 2560x1440: the DLSS render scales shrink it.
     const bool valid_extents =

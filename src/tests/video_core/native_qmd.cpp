@@ -115,6 +115,10 @@ struct AliasedMemory {
     }
     void NoteWrite(VideoCommon::GpuSplit&, Address, std::uint64_t) const {}
     void NoteWriteAt(VideoCommon::GpuSplit&, Address, std::uint64_t, std::uint64_t) const {}
+    [[nodiscard]] std::uint64_t OtherWritesTarget(const VideoCommon::GpuSplit&, Address) const {
+        return 0;
+    }
+    void NoteSemaphoreRelease(VideoCommon::GpuSplit&, Address) const {}
     [[nodiscard]] const void* Id() const {
         return this;
     }
