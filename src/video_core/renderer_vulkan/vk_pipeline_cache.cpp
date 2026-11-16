@@ -770,13 +770,28 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .support_handle_table_arrays = device.IsSampledImageArrayNonUniformIndexingSupported(),
         .needs_lrz_disable = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
     };
+    // MoltenVK allows 16 samplers a stage, but more in sets from update-after-bind pools, which
+    // it puts in Metal argument buffers. Layouts over the core limits take such a pool
+    // (DescriptorLayoutBuilder).
+    if (const auto limits = device.UpdateAfterBindSampledLimits()) {
+        host_info.max_per_stage_descriptor_samplers = limits->per_stage_samplers;
+        host_info.max_per_stage_descriptor_sampled_images = limits->per_stage_sampled_images;
+        host_info.max_per_stage_resources = limits->per_stage_resources;
+        host_info.max_descriptor_set_samplers = limits->set_samplers;
+        host_info.max_descriptor_set_sampled_images = limits->set_sampled_images;
+        LOG_INFO(Render_Vulkan,
+                 "Descriptor sets over the core limits ({} samplers a stage) use update-after-bind "
+                 "pools: up to {} samplers and {} sampled images a stage",
+                 device.GetMaxPerStageDescriptorSamplers(), limits->per_stage_samplers,
+                 limits->per_stage_sampled_images);
+    }
     host_info.ApplyDescriptorLimitPolicy();
 
     LOG_INFO(Render_Vulkan,
              "Bindless handle tables: sampled image arrays indexed per invocation {}, up to {} "
              "sampled images per stage",
              device.IsSampledImageArrayNonUniformIndexingSupported() ? "supported" : "unsupported",
-             device.GetMaxPerStageDescriptorSampledImages());
+             host_info.max_per_stage_descriptor_sampled_images);
 
     if (device.GetMaxVertexInputAttributes() < Maxwell::NumVertexAttributes) {
         LOG_WARNING(Render_Vulkan, "maxVertexInputAttributes is too low: {} < {}",
@@ -2834,9 +2849,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             }
         }
         if (compute_storage_buffers > device.GetMaxPerStageDescriptorStorageBuffers() ||
-            compute_sampled_images > device.GetMaxPerStageDescriptorSampledImages() ||
-            compute_samplers > device.GetMaxPerStageDescriptorSamplers() ||
-            compute_resources > device.GetMaxPerStageResources()) {
+            compute_sampled_images > host_info.max_per_stage_descriptor_sampled_images ||
+            compute_samplers > host_info.max_per_stage_descriptor_samplers ||
+            compute_resources > host_info.max_per_stage_resources) {
             LOG_WARNING(
                 Render_Vulkan,
                 "Mesh emulation skipped: {} storage buffers, {} sampled images, {} samplers "

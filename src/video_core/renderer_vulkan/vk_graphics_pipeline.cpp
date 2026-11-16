@@ -560,8 +560,9 @@ GraphicsPipeline::GraphicsPipeline(
                 .count = emulation_buffers,
                 .is_written = true,
             });
-            descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, bank_infos);
+            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, set_layout,
+                                                             bank_infos,
+                                                             builder.UsesUpdateAfterBindPool());
             if (mesh_emulation->has_task) {
                 // The distribution pass: payload, offsets, map and arguments, plus its push
                 // constants (Shader::Backend::SPIRV::MeshEmulationDistributionConstants).
@@ -604,8 +605,9 @@ GraphicsPipeline::GraphicsPipeline(
                                                          });
             }
         } else if (!uses_push_descriptor) {
-            descriptor_allocator =
-                descriptor_pool.Allocator(device, scheduler, set_layout, stage_infos);
+            descriptor_allocator = descriptor_pool.Allocator(device, scheduler, set_layout,
+                                                             stage_infos,
+                                                             builder.UsesUpdateAfterBindPool());
         }
     }
 

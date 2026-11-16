@@ -96,6 +96,18 @@ TEST_CASE("NCZBLOCK playback remains supported", "[ncz]") {
         CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
             std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
     }
+    SECTION("block count that does not match the decompressed size") {
+        // With 4 GiB blocks, 20000 bytes fit in one block; the second entry made the reader
+        // allocate a whole 4 GiB block for the first one.
+        bytes[Payload + 11] = 32;
+        CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
+            std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
+    }
+    SECTION("decompressed size that needs more blocks than the table holds") {
+        Put(bytes, Payload + 16, 40000);
+        CHECK_FALSE(Core::Crypto::IsSupportedNCZ(
+            std::make_shared<FileSys::VectorVfsFile>(std::move(bytes))));
+    }
 }
 
 namespace {

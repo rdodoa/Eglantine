@@ -1149,6 +1149,9 @@ struct Values {
     /// A title that reads GPU-written memory on the CPU needs reactive flushing whatever the
     /// setting says. Set per boot by the game overrides; the settings dialog never touches it.
     bool force_reactive_flushing{};
+    /// A title that breaks when buffers miss the GPU engines' inner writes keeps those
+    /// invalidations whatever skip_cpu_inner_invalidation says. Set per boot by the game overrides.
+    bool keep_cpu_inner_invalidation{};
 
 };
 
@@ -1204,6 +1207,7 @@ bool CurrentProgramIsSwitch2();
 /// Whether GPU-written memory is flushed back when the CPU reads it: the setting, or a title
 /// that requires it.
 bool ReactiveFlushing();
+bool SkipCpuInnerInvalidation();
 
 // The ASTC recompression in effect: astc_recompression, unless the renderer picked another one
 // for the running program (the configuration is left as is). The core clears it on load.

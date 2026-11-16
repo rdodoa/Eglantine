@@ -478,6 +478,22 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    vk::Buffer buffer;
+    vk::Check(AllocateBuffer(ci, usage, buffer));
+    return buffer;
+}
+
+vk::Buffer MemoryAllocator::TryCreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
+    vk::Buffer buffer;
+    const VkResult result = AllocateBuffer(ci, usage, buffer);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
+    return buffer;
+}
+
+VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                         vk::Buffer &buffer) const {
     // MESA will do memcpy() if not marked as host cached, so just force mark it for most buffers
     auto const anv_flags = (usage == MemoryUsage::Stream
         && device.GetDriverID() == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA)
@@ -501,7 +517,7 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (!CreateBufferInSeparatePool(ci, usage, alloc_ci, handle, allocation, alloc_info)) {
         VkResult result =
             vmaCreateBuffer(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
-        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
             // Over the device memory budget, as images are in CreateImage: buffers have no
             // unbacked fallback, and the vk::Exception a failed staging or buffer cache
             // allocation throws from the GPU thread aborts the process. Phones share RAM with
@@ -524,7 +540,9 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
             relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
         }
-        vk::Check(result);
+        if (result != VK_SUCCESS) {
+            return result;
+        }
     }
     vmaGetAllocationMemoryProperties(allocator, allocation, &property_flags);
     if (usage == MemoryUsage::DeviceLocal) {
@@ -550,8 +568,9 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
         .offset = alloc_info.offset,
         .memory_type = alloc_info.memoryType,
     };
-    return vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data, is_coherent,
-                      location, device.GetDispatchLoader());
+    buffer = vk::Buffer(handle, *device.GetLogical(), allocator, allocation, mapped_data,
+                        is_coherent, location, device.GetDispatchLoader());
+    return VK_SUCCESS;
 }
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
