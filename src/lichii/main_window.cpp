@@ -67,6 +67,7 @@
 
 #include "configuration/configure_dialog.h"
 #include "configuration/configure_input.h"
+#include "configuration/configure_network.h"
 #include "configuration/configure_per_game.h"
 #include "configuration/configure_tas.h"
 
@@ -158,6 +159,7 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 #include "common/logging.h"
 #include "common/memory_detect.h"
 #include "common/nextendo.h"
+#include "common/npln_patch_catalog.h"
 #include "common/scm_rev.h"
 #include "common/scope_exit.h"
 #include "common/string_util.h"
@@ -481,19 +483,49 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     }
 #endif
 
-    if constexpr (Common::Nextendo::OnlinePlayAvailable) {
-        connect(&nextendo_session_watcher, &QFutureWatcher<bool>::finished, this, [this] {
-            if (nextendo_session_watcher.result()) {
+    connect(&nextendo_session_watcher,
+            &QFutureWatcher<Common::Nextendo::SignOutReason>::finished, this, [this] {
+                QString why;
+                switch (nextendo_session_watcher.result()) {
+                case Common::Nextendo::SignOutReason::None:
+                    return;
+                case Common::Nextendo::SignOutReason::SessionExpired:
+                    why = tr("Your Nextendo session expired, so Lichii signed you out.");
+                    break;
+                case Common::Nextendo::SignOutReason::SessionRevoked:
+                    why = tr("Your session was ended on nextendo.network, so Lichii signed you "
+                             "out.");
+                    break;
+                case Common::Nextendo::SignOutReason::MissingScope:
+                    why = tr("Your Nextendo sign-in didn't allow online play, so Lichii signed "
+                             "you out.");
+                    break;
+                }
                 QMessageBox::warning(this, tr("Signed out of Nextendo"),
-                                     tr("Your session was ended on nextendo.network, so Lichii "
-                                        "signed you out. Sign in again in Configure > Network."));
-            }
-        });
-        connect(&nextendo_session_timer, &QTimer::timeout, this,
-                &MainWindow::KeepNextendoSessionAlive);
-        nextendo_session_timer.start(std::chrono::minutes{2});
-        KeepNextendoSessionAlive();
-    }
+                                     why + QLatin1Char(' ') +
+                                         tr("Sign in again in Configure > Network."));
+            });
+    connect(&nextendo_status_watcher,
+            &QFutureWatcher<std::optional<Common::Nextendo::OnlineStatus>>::finished, this,
+            [this] {
+                const auto status = nextendo_status_watcher.result();
+                QString message;
+                if (!Common::Nextendo::LoadAccount()) {
+                    message = tr("Nextendo online play is on, but you aren't signed in. Sign in "
+                                 "in Configure > Network.");
+                } else if (status && !status->allow) {
+                    LOG_WARNING(Frontend, "nextendo.network refuses online play: {}",
+                                status->reason);
+                    message = ConfigureNetwork::OnlineRefusal(status->reason);
+                }
+                if (!message.isEmpty()) {
+                    statusBar()->showMessage(message, 30000);
+                }
+            });
+    connect(&nextendo_session_timer, &QTimer::timeout, this,
+            &MainWindow::KeepNextendoSessionAlive);
+    nextendo_session_timer.start(std::chrono::minutes{2});
+    KeepNextendoSessionAlive();
 
     // Setup content providers.
     QtCommon::SetupContentProviders();
@@ -2402,6 +2434,26 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         }
     }
 
+    if (loader && Common::Nextendo::OnlinePlayActive()) {
+        QProgressDialog progress(tr("Checking online patches..."), QString{}, 0, 0, this);
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setWindowFlag(Qt::WindowCloseButtonHint, false);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        QFutureWatcher<void> watcher;
+        QEventLoop loop;
+        connect(&watcher, &QFutureWatcher<void>::finished, &loop, &QEventLoop::quit);
+        watcher.setFuture(QtConcurrent::run([&loader, title_id] {
+            Common::NplnPatchCatalog::PrepareForGame(
+                title_id, [&] { return loader->ReadMainBuildIdHex(*QtCommon::system); });
+        }));
+        progress.show();
+        loop.exec();
+        if (close_pending) {
+            return;
+        }
+    }
+
     QElapsedTimer load_timer;
     load_timer.start();
     if (!LoadROM(filename, params)) {
@@ -2605,6 +2657,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             ResetWindowSize720();
         }
     }
+    CheckNextendoOnlineStatus();
     OnStartGame();
 }
 
@@ -5443,6 +5496,16 @@ void MainWindow::KeepNextendoSessionAlive() {
     nextendo_session_watcher.setFuture(
         QtConcurrent::run([client_id = Settings::values.nextendo_client_id.GetValue()] {
             return Common::Nextendo::KeepSessionAlive(client_id);
+        }));
+}
+
+void MainWindow::CheckNextendoOnlineStatus() {
+    if (!Common::Nextendo::OnlinePlayActive() || nextendo_status_watcher.isRunning()) {
+        return;
+    }
+    nextendo_status_watcher.setFuture(
+        QtConcurrent::run([client_id = Settings::values.nextendo_client_id.GetValue()] {
+            return Common::Nextendo::CheckOnlineStatus(client_id);
         }));
 }
 

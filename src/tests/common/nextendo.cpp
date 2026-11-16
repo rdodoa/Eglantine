@@ -1,11 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
+#include <deque>
+#include <filesystem>
 #include <map>
+#include <mutex>
+#include <random>
 #include <string>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
+#include <fmt/format.h>
 
+#include "common/fs/path_util.h"
+#include "common/httplib.h"
 #include "common/nextendo.h"
 
 namespace Nextendo = Common::Nextendo;
@@ -32,7 +41,7 @@ TEST_CASE("Nextendo: base64url has no padding", "[common]") {
 }
 
 TEST_CASE("Nextendo: the authorize URL carries the loopback redirect and PKCE", "[common]") {
-    const std::string url = Nextendo::BuildAuthorizeUrl("nxc_test", "st", "ch");
+    const std::string url = Nextendo::BuildAuthorizeUrl("nxc_test", "st", "ch", 47823);
     REQUIRE(url.starts_with("https://nextendo.network/oauth/authorize?response_type=code"));
     REQUIRE(url.find("&client_id=nxc_test") != std::string::npos);
     REQUIRE(url.find("&redirect_uri=http%3A%2F%2F127.0.0.1%3A47823%2Fcallback") !=
@@ -132,4 +141,307 @@ TEST_CASE("Nextendo: online status reply", "[common]") {
 
     REQUIRE_FALSE(Nextendo::ParseOnlineStatus(R"({"error":"Session invalide"})").has_value());
     REQUIRE_FALSE(Nextendo::ParseOnlineStatus("not json").has_value());
+}
+
+namespace {
+
+using namespace std::chrono_literals;
+
+s64 Now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+Nextendo::Account SignedIn(s64 game_token_left, s64 access_token_left) {
+    return {.pid = 1,
+            .username = "tester",
+            .nex_token = "nx2.old",
+            .access_token = "access.old",
+            .refresh_token = "refresh.old",
+            .access_expires = Now() + access_token_left,
+            .nex_expires = Now() + game_token_left};
+}
+
+// Answers the API on 127.0.0.1 in place of nextendo.network. Each path replies with its queued
+// answers in order and repeats the last one.
+class FakeNextendo {
+public:
+    FakeNextendo() {
+        directory = std::filesystem::temp_directory_path() /
+                    fmt::format("lichii-nextendo-test-{}", std::random_device{}());
+        std::filesystem::create_directories(directory);
+        previous_config = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, directory);
+
+        const auto handle = [this](const httplib::Request& request, httplib::Response& response) {
+            std::scoped_lock lock{mutex};
+            ++hits[request.path];
+            authorization[request.path] = request.get_header_value("Authorization");
+            forms[request.path] = request.params;
+            auto& queue = replies[request.path];
+            const Canned reply = queue.empty() ? Canned{404, "{}"} : queue.front();
+            if (queue.size() > 1) {
+                queue.pop_front();
+            }
+            response.status = reply.status;
+            response.set_content(reply.body, "application/json");
+        };
+        server.Get(".*", handle);
+        server.Post(".*", handle);
+        port = server.bind_to_any_port("127.0.0.1");
+        REQUIRE(port > 0);
+        thread = std::thread{[this] { void(server.listen_after_bind()); }};
+        server.wait_until_ready();
+        Nextendo::SetApiBaseForTests(fmt::format("http://127.0.0.1:{}", port));
+        Nextendo::ClearAccount();
+    }
+
+    ~FakeNextendo() {
+        server.stop();
+        thread.join();
+        Nextendo::ClearAccount();
+        Nextendo::SetApiBaseForTests(std::string{Nextendo::ApiBase});
+        Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, previous_config);
+        std::error_code ec;
+        std::filesystem::remove_all(directory, ec);
+    }
+
+    void Answer(const std::string& path, int status, std::string body) {
+        std::scoped_lock lock{mutex};
+        replies[path].push_back({status, std::move(body)});
+    }
+
+    int Hits(const std::string& path) {
+        std::scoped_lock lock{mutex};
+        return hits[path];
+    }
+
+    int TotalHits() {
+        std::scoped_lock lock{mutex};
+        int total = 0;
+        for (const auto& [path, count] : hits) {
+            total += count;
+        }
+        return total;
+    }
+
+    std::string Authorization(const std::string& path) {
+        std::scoped_lock lock{mutex};
+        return authorization[path];
+    }
+
+    std::string Param(const std::string& path, const std::string& key) {
+        std::scoped_lock lock{mutex};
+        const auto& form = forms[path];
+        const auto it = form.find(key);
+        return it == form.end() ? std::string{} : it->second;
+    }
+
+private:
+    struct Canned {
+        int status;
+        std::string body;
+    };
+
+    std::filesystem::path directory;
+    std::filesystem::path previous_config;
+    httplib::Server server;
+    std::thread thread;
+    int port{};
+    std::mutex mutex;
+    std::map<std::string, std::deque<Canned>> replies;
+    std::map<std::string, int> hits;
+    std::map<std::string, std::string> authorization;
+    std::map<std::string, httplib::Params> forms;
+};
+
+constexpr const char* ClientId = "nxc_test";
+constexpr const char* TokenPath = "/api/oauth/token";
+constexpr const char* NexTokenPath = "/api/nex-token";
+constexpr const char* NewGameToken = R"({"nex_token":"nx2.new","pid":1,"username":"tester",)"
+                                     R"("friend_code":"SW-0000-0000-0000","expires_in":86400})";
+constexpr const char* NewAccessToken =
+    R"({"access_token":"access.new","refresh_token":"refresh.new","expires_in":3600})";
+
+} // namespace
+
+TEST_CASE("Nextendo: the game token is renewed ahead of its expiry", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+
+    Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.old");
+    REQUIRE(fake.TotalHits() == 0);
+
+    Nextendo::SaveAccount(SignedIn(Nextendo::RenewAheadSeconds - 60, 30 * 60));
+    const auto account = Nextendo::EnsureGameToken(ClientId);
+    REQUIRE(account->nex_token == "nx2.new");
+    REQUIRE(account->nex_expires >= Now() + 86400 - 5);
+    REQUIRE(fake.Hits(NexTokenPath) == 1);
+    REQUIRE(fake.Hits(TokenPath) == 0);
+    REQUIRE(fake.Authorization(NexTokenPath) == "Bearer access.old");
+}
+
+TEST_CASE("Nextendo: an expired access token is refreshed before the game token", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(TokenPath, 200, NewAccessToken);
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+
+    Nextendo::SaveAccount(SignedIn(60, -10));
+    const auto account = Nextendo::EnsureGameToken(ClientId);
+    REQUIRE(account->access_token == "access.new");
+    REQUIRE(account->refresh_token == "refresh.new");
+    REQUIRE(account->nex_token == "nx2.new");
+    REQUIRE(fake.Param(TokenPath, "grant_type") == "refresh_token");
+    REQUIRE(fake.Authorization(NexTokenPath) == "Bearer access.new");
+}
+
+TEST_CASE("Nextendo: invalid_grant signs out instead of retrying", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(TokenPath, 400, R"({"error":"invalid_grant"})");
+
+    Nextendo::SaveAccount(SignedIn(60, -10));
+    REQUIRE_FALSE(Nextendo::EnsureGameToken(ClientId).has_value());
+    REQUIRE(Nextendo::LastSignOutReason() == Nextendo::SignOutReason::SessionExpired);
+    REQUIRE_FALSE(Nextendo::EnsureGameToken(ClientId).has_value());
+    REQUIRE(fake.TotalHits() == 1);
+}
+
+TEST_CASE("Nextendo: 403 asks for a sign-in with game.matchmaking", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 403, R"({"error":"insufficient_scope"})");
+
+    Nextendo::SaveAccount(SignedIn(60, 30 * 60));
+    REQUIRE_FALSE(Nextendo::EnsureGameToken(ClientId).has_value());
+    REQUIRE(Nextendo::LastSignOutReason() == Nextendo::SignOutReason::MissingScope);
+    REQUIRE(fake.Hits(TokenPath) == 0);
+    REQUIRE(fake.Hits(NexTokenPath) == 1);
+}
+
+TEST_CASE("Nextendo: 401 refreshes the access token once", "[common]") {
+    SECTION("and the new one works") {
+        FakeNextendo fake;
+        fake.Answer(NexTokenPath, 401, "{}");
+        fake.Answer(NexTokenPath, 200, NewGameToken);
+        fake.Answer(TokenPath, 200, NewAccessToken);
+
+        Nextendo::SaveAccount(SignedIn(60, 30 * 60));
+        REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.new");
+        REQUIRE(fake.Hits(TokenPath) == 1);
+        REQUIRE(fake.Hits(NexTokenPath) == 2);
+    }
+    SECTION("and signs out when the new one is refused too") {
+        FakeNextendo fake;
+        fake.Answer(NexTokenPath, 401, "{}");
+        fake.Answer(TokenPath, 200, NewAccessToken);
+
+        Nextendo::SaveAccount(SignedIn(60, 30 * 60));
+        REQUIRE_FALSE(Nextendo::EnsureGameToken(ClientId).has_value());
+        REQUIRE(Nextendo::LastSignOutReason() == Nextendo::SignOutReason::SessionRevoked);
+        REQUIRE(fake.Hits(TokenPath) == 1);
+        REQUIRE(fake.Hits(NexTokenPath) == 2);
+    }
+}
+
+TEST_CASE("Nextendo: a server error keeps the account and backs off", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 500, "{}");
+
+    Nextendo::SaveAccount(SignedIn(60, 30 * 60));
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.old");
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.old");
+    REQUIRE(fake.Hits(NexTokenPath) == 1);
+}
+
+TEST_CASE("Nextendo: session heartbeat", "[common]") {
+    SECTION("a refused game token is renewed at the next check") {
+        FakeNextendo fake;
+        fake.Answer("/api/nex-session", 401, "{}");
+        fake.Answer(NexTokenPath, 200, NewGameToken);
+
+        Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+        REQUIRE(Nextendo::KeepSessionAlive(ClientId) == Nextendo::SignOutReason::None);
+        REQUIRE(fake.Hits(NexTokenPath) == 0);
+        REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.new");
+    }
+    SECTION("a session ended on the site signs out") {
+        FakeNextendo fake;
+        fake.Answer("/api/nex-session", 200, "{}");
+        fake.Answer("/api/session-status", 200, R"({"revoked":true})");
+
+        Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+        REQUIRE(Nextendo::KeepSessionAlive(ClientId) == Nextendo::SignOutReason::SessionRevoked);
+        REQUIRE(fake.Authorization("/api/nex-session") == "Bearer nx2.old");
+        REQUIRE_FALSE(Nextendo::LoadAccount().has_value());
+    }
+    SECTION("a refresh refused during the heartbeat is reported") {
+        FakeNextendo fake;
+        fake.Answer(TokenPath, 400, R"({"error":"invalid_grant"})");
+
+        Nextendo::SaveAccount(SignedIn(60, -10));
+        REQUIRE(Nextendo::KeepSessionAlive(ClientId) == Nextendo::SignOutReason::SessionExpired);
+    }
+}
+
+TEST_CASE("Nextendo: sign-out revokes the refresh token", "[common]") {
+    FakeNextendo fake;
+    fake.Answer("/api/oauth/revoke", 200, R"({"ok":true})");
+
+    Nextendo::RevokeToken(ClientId, "refresh.old");
+    REQUIRE(fake.Param("/api/oauth/revoke", "token") == "refresh.old");
+}
+
+TEST_CASE("Nextendo: requests stay within the per-minute budget", "[common]") {
+    FakeNextendo fake;
+    fake.Answer("/api/nex-session", 200, "{}");
+    fake.Answer("/api/session-status", 200, R"({"revoked":false})");
+
+    Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+    for (int i = 0; i < 12; ++i) {
+        void(Nextendo::KeepSessionAlive(ClientId));
+    }
+    REQUIRE(fake.TotalHits() == static_cast<int>(Nextendo::RequestsPerMinute));
+}
+
+TEST_CASE("Nextendo: sign-in takes a free port when the callback port is busy", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(TokenPath, 200, NewAccessToken);
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+    fake.Answer("/api/online-status", 200, R"({"allow":false,"reason":"discord_unlinked"})");
+
+    httplib::Server blocker;
+    blocker.set_socket_options([](socket_t) {});
+    const bool blocked = blocker.bind_to_port("127.0.0.1", Nextendo::CallbackPort);
+
+    std::thread browser;
+    std::string redirect_port;
+    const auto open_url = [&](const std::string& url) {
+        const auto field = [&url](std::string_view key) {
+            const auto start = url.find(key) + key.size();
+            return url.substr(start, url.find('&', start) - start);
+        };
+        const std::string redirect = field("&redirect_uri=http%3A%2F%2F127.0.0.1%3A");
+        redirect_port = redirect.substr(0, redirect.find('%'));
+        browser = std::thread{[port = std::stoi(redirect_port), state = field("&state=")] {
+            httplib::Client client{"127.0.0.1", port};
+            void(client.Get("/callback?code=abc&state=" + state));
+        }};
+    };
+    const auto result = Nextendo::SignIn(ClientId, open_url, std::stop_token{});
+    if (browser.joinable()) {
+        browser.join();
+    }
+
+    INFO(result.error);
+    REQUIRE(result.ok);
+    if (blocked) {
+        REQUIRE(redirect_port != std::to_string(Nextendo::CallbackPort));
+    }
+    REQUIRE(fake.Param(TokenPath, "redirect_uri") ==
+            "http://127.0.0.1:" + redirect_port + "/callback");
+    REQUIRE(result.account.nex_token == "nx2.new");
+    REQUIRE(fake.Authorization("/api/online-status") == "Bearer nx2.new");
+    REQUIRE(result.online_status.has_value());
+    REQUIRE(result.online_status->reason == "discord_unlinked");
 }

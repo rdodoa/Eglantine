@@ -9,11 +9,13 @@
 #include <cctype>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <tuple>
 #include <vector>
 
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 
 #include "common/fs/file.h"
@@ -548,17 +550,20 @@ static std::array<u8, target_size> MGF1(const std::array<u8, in_size>& seed) {
 
 template <size_t size>
 static std::optional<u64> FindTicketOffset(const std::array<u8, size>& data) {
-    u64 offset = 0;
+    // OAEP data block: the label hash (0x20 bytes), zero padding, 0x01, then the message. The
+    // message is the 16-byte title key, so the 0x01 must come right before the block's last 16
+    // bytes: a block without it, or with a message of another size, holds no title key.
     for (size_t i = 0x20; i < data.size() - 0x10; ++i) {
         if (data[i] == 0x1) {
-            offset = i + 1;
-            break;
+            if (i + 1 + 0x10 != data.size()) {
+                return std::nullopt;
+            }
+            return u64(i + 1);
         } else if (data[i] != 0x0) {
             return std::nullopt;
         }
     }
-
-    return offset;
+    return std::nullopt;
 }
 
 std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
@@ -595,20 +600,32 @@ std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
 
     std::array<u8, 0x100> rsa_step;
     {
-        // Private context for OpenSSL bignumbers
-        // Inside block because I dont wanna pollute the space...
+        // BN_mod_exp needs a BN_CTX (a null one crashed), and BN_bn2bin drops the leading zero
+        // byte every OAEP block starts with, so the block is written padded to its size.
+        using BigNum = std::unique_ptr<BIGNUM, decltype(&BN_clear_free)>;
         const auto& title_key_block = ticket.GetData().title_key_block;
-        BIGNUM* D = BN_bin2bn(eticket_rsa_keypair.decryption_key.data(), int(eticket_rsa_keypair.decryption_key.size()), NULL);
-        BIGNUM* N = BN_bin2bn(eticket_rsa_keypair.modulus.data(), int(eticket_rsa_keypair.modulus.size()), NULL);
-        BIGNUM* S = BN_bin2bn(title_key_block.data(), int(title_key_block.size()), NULL);
-        BIGNUM* M = BN_new();
+        const BigNum D{BN_bin2bn(eticket_rsa_keypair.decryption_key.data(),
+                                 int(eticket_rsa_keypair.decryption_key.size()), nullptr),
+                       BN_clear_free};
+        const BigNum N{BN_bin2bn(eticket_rsa_keypair.modulus.data(),
+                                 int(eticket_rsa_keypair.modulus.size()), nullptr),
+                       BN_clear_free};
+        const BigNum S{BN_bin2bn(title_key_block.data(), int(title_key_block.size()), nullptr),
+                       BN_clear_free};
+        const BigNum M{BN_new(), BN_clear_free};
+        const std::unique_ptr<BN_CTX, decltype(&BN_CTX_free)> bn_ctx{BN_CTX_new(), BN_CTX_free};
+        if (!D || !N || !S || !M || !bn_ctx) {
+            LOG_ERROR(Crypto, "Could not allocate the numbers to decrypt a personalized ticket.");
+            return std::nullopt;
+        }
+        // D is the private exponent.
+        BN_set_flags(D.get(), BN_FLG_CONSTTIME);
         // M = S ^ D mod N
-        BN_mod_exp(M, S, D, N, NULL);
-        BN_bn2bin(M, rsa_step.data());
-        BN_free(D);
-        BN_free(N);
-        BN_free(S);
-        BN_free(M);
+        if (BN_mod_exp(M.get(), S.get(), D.get(), N.get(), bn_ctx.get()) != 1 ||
+            BN_bn2binpad(M.get(), rsa_step.data(), int(rsa_step.size())) != int(rsa_step.size())) {
+            LOG_ERROR(Crypto, "Could not decrypt the title key block of a personalized ticket.");
+            return std::nullopt;
+        }
     }
 
     u8 m_0 = rsa_step[0];
@@ -628,7 +645,6 @@ std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
     if (!offset) {
         return std::nullopt;
     }
-    ASSERT(*offset > 0);
 
     Key128 key_temp{};
     std::memcpy(key_temp.data(), m_2.data() + *offset, key_temp.size());
