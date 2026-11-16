@@ -24,6 +24,7 @@ add_executable(tests
     core/mii_model.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
+    core/general_channel.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
     core/nx2_zip.cpp
@@ -32,6 +33,7 @@ add_executable(tests
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
     core/perf_stats.cpp
+    core/service_auto_stub.cpp
     core/key_derivation.cpp
     common/display_hdr.cpp
     common/dkb_cpu_trace.cpp
@@ -51,6 +53,7 @@ add_executable(tests
     audio_core/microphone.cpp
     audio_core/hardware_audio_codec.cpp
     core/gpu_dirty_memory.cpp
+    core/nso_loader.cpp
     core/memory_acquire.cpp
     core/kip_sections.cpp
     core/memory_span.cpp
@@ -77,6 +80,7 @@ add_executable(tests
     core/vfs_vector.cpp
     core/kip_ini.cpp
     core/ncz_cache.cpp
+    core/kip_truncated.cpp
     core/ncz_decompressor.cpp
     core/ncz_io_guards.cpp
     core/ncz_container.cpp

@@ -118,6 +118,12 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
     for (std::size_t i = 0; i < header.sections.size(); ++i) {
         auto compressed = file->ReadBytes(header.sections[i].compressed_size, offset);
         offset += header.sections[i].compressed_size;
+        // A section the file does not hold in full is a truncated KIP: ReadBytes stops at the end
+        // of the file, which used to leave a stored section shorter than its header says.
+        if (compressed.size() != header.sections[i].compressed_size) {
+            status = Loader::ResultStatus::ErrorBadKIPHeader;
+            return;
+        }
 
         if (header.sections[i].compressed_size == 0 && header.sections[i].decompressed_size != 0) {
             // Sections 3 to 5 (.bss and two unused ones) hold no file data and nothing reads

@@ -187,8 +187,9 @@ namespace Vulkan {
                                vk::Image &image) const;
 
         /// CreateBuffer's fallbacks; the buffer is left null when the result is an error.
+        /// min_alignment over 1 aligns the allocation and skips the separate buffer pool.
         VkResult AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
-                                vk::Buffer &buffer) const;
+                                VkDeviceSize min_alignment, vk::Buffer &buffer) const;
 
         /// A device-local image or buffer that VMA quietly placed in host memory because the
         /// device heap was over its budget (VMA picks another memory type instead of failing).

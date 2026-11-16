@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -181,17 +182,67 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return 0;
     }();
 
-    auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
+    // The image ends where the furthest segment ends. The header gives the segments in order, but
+    // it comes from the file: sizing the image by the last one let an earlier segment be copied
+    // past its end.
+    u64 segments_end = 0;
+    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
+        const auto& segment = nso_header.segments[i];
+        segments_end = std::max<u64>(segments_end, u64{segment.location} + segment.size);
+        // A stored segment is copied from the bytes read for it.
+        if (!nso_header.IsSegmentCompressed(i) &&
+            segment.size > nso_header.segments_compressed_size[i]) {
+            LOG_ERROR(Loader, "{}: stored segment {} is larger than its data", nso_file.GetName(),
+                      i);
+            return std::nullopt;
+        }
+    }
+    // The whole image, the argument block and .bss included, is sized and aligned in u32 below:
+    // check its extent in 64 bits before allocating, so a segment near the top of the address
+    // space can neither wrap that arithmetic nor ask for gigabytes.
+    const bool pass_arguments =
+        should_pass_arguments && !Settings::values.program_args.GetValue().empty();
+    // A Split or PostData patch appends its section after the image when it is copied in, and
+    // the image size is narrowed to u32 after that: count the section too.
+    const size_t post_patch_size = [&]() -> size_t {
+#ifdef HAS_NCE
+        if (patches && load_into_process) {
+            auto* patch = &patches->operator[](patch_index);
+            if (patch->GetPatchMode() == Core::NCE::PatchMode::Split ||
+                patch->GetPatchMode() == Core::NCE::PatchMode::PostData) {
+                return patch->GetSectionSize();
+            }
+        }
+#endif
+        return 0;
+    }();
+    const u64 aligned_extent =
+        (u64{module_start} + segments_end + (pass_arguments ? NSO_ARGUMENT_DATA_ALLOCATION_SIZE : 0) +
+         nso_header.segments[2].bss_size + Core::Memory::LICHII_PAGEMASK) &
+        ~u64{Core::Memory::LICHII_PAGEMASK};
+    const u64 image_extent = aligned_extent + post_patch_size;
+    if (image_extent > std::numeric_limits<u32>::max()) {
+        LOG_ERROR(Loader, "{}: segments end at {:#x}, past a 32-bit image", nso_file.GetName(),
+                  image_extent);
+        return std::nullopt;
+    }
     // Build program image directly in codeset memory :)
     Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
+    codeset.memory.resize(module_start + segments_end);
     {
         std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
         std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
             return a.size < b.size;
         })->size);
         for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
+            // A short read would leave the previous segment's bytes in the buffer, as below.
+            if (nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i],
+                              nso_header.segments[i].offset) !=
+                nso_header.segments_compressed_size[i]) {
+                LOG_ERROR(Loader, "{}: segment {} is past the end of the file", nso_file.GetName(),
+                          i);
+                return std::nullopt;
+            }
             if (nso_header.IsSegmentCompressed(i)) {
                 const u32 segment_size = nso_header.segments[i].size;
                 if (nso_header.IsZBICCompressed()) {
@@ -221,7 +272,13 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                         compressed_data.data(),
                         nso_header.segments_compressed_size[i]
                     );
-                    ASSERT(r == int(segment_size));
+                    // As for ZBIC: a segment that does not decompress to its size would boot with
+                    // the previous segment's bytes in its place.
+                    if (r != int(segment_size)) {
+                        LOG_ERROR(Loader, "{}: segment {} decompressed to {} of {:#x} bytes",
+                                  nso_file.GetName(), i, r, segment_size);
+                        return std::nullopt;
+                    }
                 }
 
                 std::memcpy(
@@ -243,7 +300,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         }
     }
 
-    if (should_pass_arguments && !Settings::values.program_args.GetValue().empty()) {
+    if (pass_arguments) {
         const auto arg_data{Settings::values.program_args.GetValue()};
 
         codeset.DataSegment().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
