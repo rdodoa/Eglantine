@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stop_token>
@@ -32,6 +33,13 @@ private:
     void SignInToNextendo();
     void RenewNextendoToken();
     void UpdateNextendoStatus(const QString& error = {}, bool signed_in = false);
+    void ShowNextendoFriends();
+    void UpdateNextendoFriendButtons();
+    // Runs a friends request in the background, then shows the friend list it leaves cached.
+    void RunFriendsRequest(
+        std::function<Common::Nextendo::SocialResult(const std::string& client_id)> request,
+        const QString& done = {});
+    void AnswerNextendoFriend(Common::Nextendo::FriendAction action);
 
     std::unique_ptr<Ui::ConfigureNetwork> ui;
     std::stop_source nextendo_stop;

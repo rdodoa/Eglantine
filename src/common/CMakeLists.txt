@@ -169,6 +169,8 @@ add_library(
     net/ca_store.h net/net.h net/net.cpp
     nextendo.cpp
     nextendo.h
+    nextendo_game_catalog.cpp
+    nextendo_game_catalog.h
     npln_patch_catalog.cpp
     npln_patch_catalog.h
     npln_patch_manifest.cpp

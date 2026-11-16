@@ -101,6 +101,14 @@ private:
     std::map<Key, Patch> active;
 };
 
+// The payload of a signed service catalogue, {key_id, payload, signature} with an Ed25519
+// signature over the decoded payload. The game catalogue is signed the same way. Throws
+// std::runtime_error when the key id or the signature doesn't match.
+std::vector<u8> VerifyEnvelope(const std::string& envelope, std::string_view key_id,
+                               std::string_view public_key);
+// An RFC 3339 UTC time as the catalogues write it, in Unix seconds. Throws std::runtime_error.
+s64 Timestamp(const std::string& text);
+
 // These throw std::runtime_error for a document that fails verification.
 TitleIndex VerifyTitleIndex(const std::string& envelope, std::string_view public_key, s64 now,
                             bool allow_expired = false);

@@ -40,6 +40,7 @@ add_library(video_core STATIC
     dirty_flags.h
     dma_pusher.cpp
     dma_pusher.h
+    due_composites.h
     engines/sw_blitter/blitter.cpp
     engines/sw_blitter/blitter.h
     engines/sw_blitter/converter.cpp

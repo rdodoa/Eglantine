@@ -8,8 +8,13 @@
 #include <array>
 #include <charconv>
 #include <mutex>
+#include <ranges>
+#include <sstream>
 #include <unordered_map>
+#include <vector>
 
+#include "common/fs/file.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "common/nextendo.h"
 #include "common/settings.h"
@@ -26,16 +31,30 @@ bool IsDomainOrSubdomain(std::string_view host, std::string_view domain) {
             host[host.size() - domain.size() - 1] == '.');
 }
 
-// "*" matches any run of characters.
+// "*" matches any run of characters, dots included.
 bool MatchesPattern(std::string_view host, std::string_view pattern) {
-    const auto star = pattern.find('*');
-    if (star == std::string_view::npos) {
-        return host == pattern;
+    std::size_t h = 0;
+    std::size_t p = 0;
+    std::size_t star = std::string_view::npos;
+    std::size_t resume = 0;
+    while (h < host.size()) {
+        if (p < pattern.size() && pattern[p] == '*') {
+            star = p++;
+            resume = h;
+        } else if (p < pattern.size() && pattern[p] == host[h]) {
+            ++p;
+            ++h;
+        } else if (star != std::string_view::npos) {
+            p = star + 1;
+            h = ++resume;
+        } else {
+            return false;
+        }
     }
-    const auto prefix = pattern.substr(0, star);
-    const auto suffix = pattern.substr(star + 1);
-    return host.size() >= prefix.size() + suffix.size() && host.starts_with(prefix) &&
-           host.ends_with(suffix);
+    while (p < pattern.size() && pattern[p] == '*') {
+        ++p;
+    }
+    return p == pattern.size();
 }
 
 struct TitleHosts {
@@ -98,25 +117,66 @@ bool IsTitleHost(std::string_view host, u64 program_id) {
     return false;
 }
 
+struct HostsEntry {
+    std::string pattern;
+    std::string address;
+};
+
+// Atmosphère's syntax: "<address> <name>...", "#" starts a comment, "*" matches any run of
+// characters and "%" stands for the environment. Lichii resolves IPv4 only.
+std::vector<HostsEntry> ReadHostsFile() {
+    const auto path = Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir) / "atmosphere" /
+                      "hosts" / "default.txt";
+    std::istringstream lines{Common::FS::ReadStringFromFile(path, Common::FS::FileType::TextFile)};
+    std::vector<HostsEntry> entries;
+    for (std::string line; std::getline(lines, line);) {
+        line.resize(std::min(line.find('#'), line.size()));
+        std::istringstream words{line};
+        std::string text;
+        if (!(words >> text)) {
+            continue;
+        }
+        const auto ip = ParseIPv4(text);
+        if (!ip) {
+            continue;
+        }
+        const auto address = fmt::format("{}.{}.{}.{}", (*ip)[0], (*ip)[1], (*ip)[2], (*ip)[3]);
+        for (std::string name; words >> name;) {
+            entries.push_back({Common::ReplaceAll(Common::ToLower(name), "%", "lp1"), address});
+        }
+    }
+    return entries;
+}
+
+std::optional<std::string> ExactHostsEntry(const std::vector<HostsEntry>& entries,
+                                           std::string_view host) {
+    const auto it = std::ranges::find_if(entries | std::views::reverse, [host](const auto& entry) {
+        return entry.pattern.find('*') == std::string::npos && entry.pattern == host;
+    });
+    return it == entries.rend() ? std::nullopt : std::optional{it->address};
+}
+
+// The most specific match: the fewest wildcards, then the longest pattern, then the last.
+std::optional<std::string> WildcardHostsEntry(const std::vector<HostsEntry>& entries,
+                                              std::string_view host) {
+    const HostsEntry* best = nullptr;
+    const auto stars = [](const HostsEntry& entry) {
+        return std::ranges::count(entry.pattern, '*');
+    };
+    for (const auto& entry : entries) {
+        if (entry.pattern.find('*') == std::string::npos || !MatchesPattern(host, entry.pattern)) {
+            continue;
+        }
+        if (best == nullptr || stars(entry) < stars(*best) ||
+            (stars(entry) == stars(*best) && entry.pattern.size() >= best->pattern.size())) {
+            best = &entry;
+        }
+    }
+    return best == nullptr ? std::nullopt : std::optional{best->address};
+}
+
 std::mutex host_mutex;
 std::unordered_map<std::string, std::string> host_for_address;
-
-std::optional<Network::IPv4Address> ParseIPv4(std::string_view text) {
-    Network::IPv4Address ip{};
-    const char* position = text.data();
-    const char* const end = text.data() + text.size();
-    for (std::size_t i = 0; i < ip.size(); ++i) {
-        if (i > 0 && (position == end || *position++ != '.')) {
-            return std::nullopt;
-        }
-        const auto [next, error] = std::from_chars(position, end, ip[i]);
-        if (error != std::errc{}) {
-            return std::nullopt;
-        }
-        position = next;
-    }
-    return position == end ? std::optional{ip} : std::nullopt;
-}
 
 } // namespace
 
@@ -144,27 +204,57 @@ std::optional<Target> Classify(std::string_view host, u64 program_id) {
 }
 
 std::optional<std::string> RedirectAddress(std::string_view host, u64 program_id) {
-    if (!Common::Nextendo::OnlinePlayActive()) {
+    if (!Common::Nextendo::OnlinePlayActive() || ParseIPv4(host)) {
         return std::nullopt;
     }
-    const auto target = Classify(host, program_id);
-    if (!target) {
-        return std::nullopt;
+    const std::string name = Common::ToLower(host);
+    const auto hosts = ReadHostsFile();
+    auto address = ExactHostsEntry(hosts, name);
+    if (!address) {
+        if (const auto target = Classify(host, program_id)) {
+            std::string configured = *target == Target::Nat
+                                         ? Settings::values.nextendo_nat_ip.GetValue()
+                                         : Settings::values.nextendo_server_ip.GetValue();
+            if (!configured.empty()) {
+                address = std::move(configured);
+            }
+        }
     }
-    std::string address = *target == Target::Nat ? Settings::values.nextendo_nat_ip.GetValue()
-                                                 : Settings::values.nextendo_server_ip.GetValue();
-    if (address.empty()) {
-        return std::nullopt;
+    if (!address) {
+        address = WildcardHostsEntry(hosts, name);
     }
-    LOG_INFO(Service, "Nextendo: resolving {} to {}", host, address);
+    if (address) {
+        LOG_INFO(Service, "Nextendo: resolving {} to {}", host, *address);
+    }
     return address;
 }
 
-std::string ExpandNsdHost(std::string host) {
-    if (const auto pos = host.find('%'); pos != std::string::npos) {
-        host.replace(pos, 1, "lp1");
+std::string ResolveFqdn(std::string host) {
+    if (Common::Nextendo::OnlinePlayActive() &&
+        (host == "accounts.nintendo.com" || host == "api.accounts.nintendo.com")) {
+        return "e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com";
     }
-    return host;
+    return Common::ReplaceAll(std::move(host), "%", "lp1");
+}
+
+std::optional<std::array<u8, 4>> ParseIPv4(std::string_view text) {
+    std::array<u8, 4> address{};
+    for (std::size_t i = 0; i < address.size(); ++i) {
+        const auto dot = text.find('.');
+        if ((dot == std::string_view::npos) != (i == address.size() - 1)) {
+            return std::nullopt;
+        }
+        const auto part = text.substr(0, dot);
+        unsigned value = 0;
+        const auto [end, ec] = std::from_chars(part.data(), part.data() + part.size(), value);
+        if (part.empty() || part.size() > 3 || ec != std::errc{} ||
+            end != part.data() + part.size() || value > 255) {
+            return std::nullopt;
+        }
+        address[i] = static_cast<u8>(value);
+        text.remove_prefix(dot == std::string_view::npos ? text.size() : dot + 1);
+    }
+    return address;
 }
 
 void RememberHost(const std::string& address, const std::string& host) {

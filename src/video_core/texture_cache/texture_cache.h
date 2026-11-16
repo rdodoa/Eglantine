@@ -3010,6 +3010,15 @@ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
     if (!image.info.rescaleable) {
         return false;
     }
+    if constexpr (requires { runtime.GetMaxScaledExtent(); }) {
+        // Past the device's limits the scaled image is invalid. Ocarina of Time's 12288x12288
+        // sun shadow map is 18432 wide at 1.5x and 24576 at 2x, over AMD's 16384, and drawing
+        // into it hangs the GPU (#1885).
+        if (!ScaledImageFits(image.info, Settings::values.resolution_info,
+                             runtime.GetMaxScaledExtent())) {
+            return false;
+        }
+    }
     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
         return false;
     }

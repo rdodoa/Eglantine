@@ -1609,13 +1609,19 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     const auto dlc_entries_with_origin =
         content_union->ListEntriesFilterOrigin(std::nullopt, TitleType::AOC, ContentRecordType::Data);
 
+    std::vector<u64> add_on_content;
+    add_on_content.reserve(dlc_entries_with_origin.size());
+    for (const auto& [slot, entry] : dlc_entries_with_origin) {
+        add_on_content.push_back(entry.title_id);
+    }
+    const u64 add_on_base = GetAddOnApplicationID(title_id, add_on_content);
+
     dlc_match.reserve(dlc_entries_with_origin.size());
     for (const auto& [slot, entry] : dlc_entries_with_origin) {
         const auto base_tid = GetBaseTitleID(entry.title_id);
-        const bool matches_base = base_tid == title_id;
-        if (!matches_base) {
+        if (base_tid != add_on_base) {
             LOG_DEBUG(Loader, "DLC {:016X} base {:016X} doesn't match title {:016X}",
-                      entry.title_id, base_tid, title_id);
+                      entry.title_id, base_tid, add_on_base);
             continue;
         }
 

@@ -16,7 +16,9 @@
 #include <vector>
 
 #include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/params.h>
 
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
@@ -1005,21 +1007,31 @@ void KeyManager::DeriveSDSeedLazy() {
     }
 }
 
-static Key128 CalculateCMAC(const u8* source, size_t size, const Key128& key) {
+std::optional<Key128> CalculateCMAC(std::span<const u8> source, const Key128& key) {
+    // OpenSSL's CMAC takes the key length in bytes and needs its cipher named; given neither,
+    // every call failed and returned zeros.
+    static EVP_MAC* const mac = EVP_MAC_fetch(nullptr, "CMAC", nullptr);
+    if (mac == nullptr) {
+        return std::nullopt;
+    }
+    const std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> ctx{EVP_MAC_CTX_new(mac),
+                                                                       EVP_MAC_CTX_free};
+    if (!ctx) {
+        return std::nullopt;
+    }
+
+    char cipher[] = "AES-128-CBC";
+    const std::array params{
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, cipher, 0),
+        OSSL_PARAM_construct_end(),
+    };
     Key128 out{};
-
-    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "cmac", nullptr);
-    if (!mac) return out;
-
-    static EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    if (!ctx) return out;
-
-    EVP_MAC_init(ctx, key.data(), key.size() * CHAR_BIT, NULL);
-    EVP_MAC_update(ctx, source, size);
-
-    size_t len;
-    EVP_MAC_final(ctx, out.data(), &len, out.size());
-
+    size_t length = 0;
+    if (EVP_MAC_init(ctx.get(), key.data(), key.size(), params.data()) != 1 ||
+        EVP_MAC_update(ctx.get(), source.data(), source.size()) != 1 ||
+        EVP_MAC_final(ctx.get(), out.data(), &length, out.size()) != 1 || length != out.size()) {
+        return std::nullopt;
+    }
     return out;
 }
 
@@ -1091,8 +1103,13 @@ void KeyManager::DeriveBase() {
             key, GetKey(S128KeyType::Source, u64(SourceKeyType::KeyblobMAC)));
         SetKey(S128KeyType::KeyblobMAC, mac_key, i);
 
-        Key128 cmac = CalculateCMAC(encrypted_keyblobs[i].data() + 0x10, 0xA0, mac_key);
-        if (std::memcmp(cmac.data(), encrypted_keyblobs[i].data(), cmac.size()) != 0) {
+        const auto cmac =
+            CalculateCMAC(std::span{encrypted_keyblobs[i]}.subspan(0x10, 0xA0), mac_key);
+        if (!cmac) {
+            LOG_ERROR(Crypto, "Could not compute the MAC of encrypted_keyblob_{:02x}", i);
+            continue;
+        }
+        if (std::memcmp(cmac->data(), encrypted_keyblobs[i].data(), cmac->size()) != 0) {
             continue;
         }
 

@@ -81,29 +81,6 @@ u64 TitleId(std::string_view text) {
     return title_id;
 }
 
-s64 Timestamp(const std::string& text) {
-    if (text.size() < 20 || text.back() != 'Z') {
-        throw std::runtime_error("Invalid patch catalog timestamp");
-    }
-    if (text.size() > 20 &&
-        (text[19] != '.' || !std::all_of(text.begin() + 20, text.end() - 1,
-                                         [](char c) { return c >= '0' && c <= '9'; }))) {
-        throw std::runtime_error("Invalid patch catalog timestamp");
-    }
-
-    std::tm tm{};
-    std::istringstream input(text.substr(0, 19));
-    input >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
-    if (input.fail()) {
-        throw std::runtime_error("Invalid patch catalog timestamp");
-    }
-#ifdef _WIN32
-    return static_cast<s64>(_mkgmtime(&tm));
-#else
-    return static_cast<s64>(timegm(&tm));
-#endif
-}
-
 void ValidateTag(const std::string& tag) {
     if (tag.size() != 66 || tag.front() != '"' || tag.back() != '"') {
         throw std::runtime_error("Invalid signed catalog tag");
@@ -151,19 +128,38 @@ void ValidateRecords(const Patch& patch) {
 
 Json VerifyDocument(const std::string& envelope, std::string_view public_key,
                     std::string_view document_type, s64 now, bool allow_expired) {
+    const auto payload = VerifyEnvelope(envelope, "npln-patches-key-1", public_key);
+    const auto doc = Json::parse(payload.begin(), payload.end());
+    if (doc.at("document_type").get<std::string>() != document_type ||
+        doc.at("schema_version") != 1 || !doc.at("revision").is_number_unsigned() ||
+        doc.at("revision").get<u64>() == 0) {
+        throw std::runtime_error("Unsupported patch catalog");
+    }
+    const auto issued = Timestamp(doc.at("issued_at").get<std::string>());
+    const auto expires = Timestamp(doc.at("expires_at").get<std::string>());
+    if (expires <= issued || expires - issued > 86400 || (!allow_expired && expires <= now)) {
+        throw std::runtime_error("Patch catalog outside its validity period");
+    }
+    return doc;
+}
+
+} // namespace
+
+std::vector<u8> VerifyEnvelope(const std::string& envelope, std::string_view key_id,
+                               std::string_view public_key) {
     if (envelope.size() > MaxDocument) {
-        throw std::runtime_error("Patch catalog too large");
+        throw std::runtime_error("Signed catalog too large");
     }
 
     const auto outer = Json::parse(envelope);
-    if (outer.at("key_id") != "npln-patches-key-1") {
-        throw std::runtime_error("Unknown patch signing key");
+    if (outer.at("key_id").get<std::string>() != key_id) {
+        throw std::runtime_error("Unknown catalog signing key");
     }
     const auto key = Base64(public_key);
-    const auto payload = Base64(outer.at("payload").get<std::string>());
+    auto payload = Base64(outer.at("payload").get<std::string>());
     const auto signature = Base64(outer.at("signature").get<std::string>());
     if (key.size() != 32 || signature.size() != 64) {
-        throw std::runtime_error("Invalid patch signature size");
+        throw std::runtime_error("Invalid catalog signature size");
     }
 
     std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> verifier(
@@ -175,25 +171,33 @@ Json VerifyDocument(const std::string& envelope, std::string_view public_key,
         EVP_DigestVerifyInit(context.get(), nullptr, nullptr, nullptr, verifier.get()) != 1 ||
         EVP_DigestVerify(context.get(), signature.data(), signature.size(), payload.data(),
                          payload.size()) != 1) {
-        throw std::runtime_error("Invalid patch catalog signature");
+        throw std::runtime_error("Invalid catalog signature");
     }
-
-    const auto doc = Json::parse(payload.begin(), payload.end());
-    if (doc.at("document_type").get<std::string>() != document_type ||
-        doc.at("schema_version") != 1 || !doc.at("revision").is_number_unsigned() ||
-        doc.at("revision").get<u64>() == 0) {
-        throw std::runtime_error("Unsupported patch catalog");
-    }
-    const auto issued = Timestamp(doc.at("issued_at").get<std::string>());
-    const auto expires = Timestamp(doc.at("expires_at").get<std::string>());
-    if (expires <= issued || expires - issued > 86400 ||
-        (!allow_expired && expires <= now)) {
-        throw std::runtime_error("Patch catalog outside its validity period");
-    }
-    return doc;
+    return payload;
 }
 
-} // namespace
+s64 Timestamp(const std::string& text) {
+    if (text.size() < 20 || text.back() != 'Z') {
+        throw std::runtime_error("Invalid catalog timestamp");
+    }
+    if (text.size() > 20 &&
+        (text[19] != '.' || !std::all_of(text.begin() + 20, text.end() - 1,
+                                         [](char c) { return c >= '0' && c <= '9'; }))) {
+        throw std::runtime_error("Invalid catalog timestamp");
+    }
+
+    std::tm tm{};
+    std::istringstream input(text.substr(0, 19));
+    input >> std::get_time(&tm, "%Y-%m-%dT%H:%M:%S");
+    if (input.fail()) {
+        throw std::runtime_error("Invalid catalog timestamp");
+    }
+#ifdef _WIN32
+    return static_cast<s64>(_mkgmtime(&tm));
+#else
+    return static_cast<s64>(timegm(&tm));
+#endif
+}
 
 TitleIndex VerifyTitleIndex(const std::string& envelope, std::string_view public_key, s64 now,
                             bool allow_expired) {

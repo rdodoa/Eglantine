@@ -1,21 +1,29 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <array>
 #include <chrono>
+#include <ctime>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <random>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 #include <fmt/format.h>
+#include <nlohmann/json.hpp>
+#include <openssl/evp.h>
 
 #include "common/fs/path_util.h"
 #include "common/httplib.h"
 #include "common/nextendo.h"
+#include "common/nextendo_game_catalog.h"
+#include "common/settings.h"
 
 namespace Nextendo = Common::Nextendo;
 
@@ -172,13 +180,16 @@ public:
                     fmt::format("lichii-nextendo-test-{}", std::random_device{}());
         std::filesystem::create_directories(directory);
         previous_config = Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir);
+        previous_cache = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir);
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, directory);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::CacheDir, directory);
 
         const auto handle = [this](const httplib::Request& request, httplib::Response& response) {
             std::scoped_lock lock{mutex};
             ++hits[request.path];
             authorization[request.path] = request.get_header_value("Authorization");
             forms[request.path] = request.params;
+            bodies[request.path] = request.body;
             auto& queue = replies[request.path];
             const Canned reply = queue.empty() ? Canned{404, "{}"} : queue.front();
             if (queue.size() > 1) {
@@ -203,6 +214,7 @@ public:
         Nextendo::ClearAccount();
         Nextendo::SetApiBaseForTests(std::string{Nextendo::ApiBase});
         Common::FS::SetEdenPath(Common::FS::EdenPath::ConfigDir, previous_config);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::CacheDir, previous_cache);
         std::error_code ec;
         std::filesystem::remove_all(directory, ec);
     }
@@ -231,6 +243,11 @@ public:
         return authorization[path];
     }
 
+    std::string Body(const std::string& path) {
+        std::scoped_lock lock{mutex};
+        return bodies[path];
+    }
+
     std::string Param(const std::string& path, const std::string& key) {
         std::scoped_lock lock{mutex};
         const auto& form = forms[path];
@@ -246,6 +263,7 @@ private:
 
     std::filesystem::path directory;
     std::filesystem::path previous_config;
+    std::filesystem::path previous_cache;
     httplib::Server server;
     std::thread thread;
     int port{};
@@ -254,6 +272,7 @@ private:
     std::map<std::string, int> hits;
     std::map<std::string, std::string> authorization;
     std::map<std::string, httplib::Params> forms;
+    std::map<std::string, std::string> bodies;
 };
 
 constexpr const char* ClientId = "nxc_test";
@@ -444,4 +463,447 @@ TEST_CASE("Nextendo: sign-in takes a free port when the callback port is busy", 
     REQUIRE(fake.Authorization("/api/online-status") == "Bearer nx2.new");
     REQUIRE(result.online_status.has_value());
     REQUIRE(result.online_status->reason == "discord_unlinked");
+}
+
+namespace {
+
+// Answers each authorize URL a sign-in opens with the next callback query, as the browser would.
+class FakeBrowser {
+public:
+    explicit FakeBrowser(std::vector<std::string> queries_) : queries{std::move(queries_)} {}
+
+    ~FakeBrowser() {
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+
+    std::function<void(const std::string&)> Opener() {
+        return [this](const std::string& url) {
+            const auto field = [&url](std::string_view key) {
+                const auto start = url.find(key) + key.size();
+                return url.substr(start, url.find('&', start) - start);
+            };
+            const std::string redirect = field("&redirect_uri=http%3A%2F%2F127.0.0.1%3A");
+            const int port = std::stoi(redirect.substr(0, redirect.find('%')));
+            const std::string query = queries.at(scopes.size());
+            scopes.push_back(field("&scope="));
+            threads.emplace_back([port, query, state = field("&state=")] {
+                httplib::Client client{"127.0.0.1", port};
+                void(client.Get("/callback?" + query + "&state=" + state));
+            });
+        };
+    }
+
+    // The scope each authorize URL asked for, percent-encoded.
+    std::vector<std::string> scopes;
+
+private:
+    std::vector<std::string> queries;
+    std::vector<std::thread> threads;
+};
+
+constexpr const char* FullScope = "identity%20game.matchmaking%20friends%20presence";
+constexpr const char* OnlineScope = "identity%20game.matchmaking";
+
+} // namespace
+
+TEST_CASE("Nextendo: a sign-in refused the social scopes signs in without them", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+    SECTION("when the authorize step refuses them") {
+        fake.Answer(TokenPath, 200, NewAccessToken);
+        FakeBrowser browser{{"error=invalid_scope", "code=abc"}};
+        const auto result = Nextendo::SignIn(ClientId, browser.Opener(), {});
+        INFO(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(browser.scopes == std::vector<std::string>{FullScope, OnlineScope});
+        REQUIRE(fake.Hits(TokenPath) == 1);
+    }
+    SECTION("when the token exchange refuses them") {
+        fake.Answer(TokenPath, 400,
+                    R"({"error":"invalid_request","error_description":"scope)"
+                    R"( friends is not allowed for this client"})");
+        fake.Answer(TokenPath, 200, NewAccessToken);
+        FakeBrowser browser{{"code=abc", "code=def"}};
+        const auto result = Nextendo::SignIn(ClientId, browser.Opener(), {});
+        INFO(result.error);
+        REQUIRE(result.ok);
+        REQUIRE(browser.scopes == std::vector<std::string>{FullScope, OnlineScope});
+        REQUIRE(fake.Hits(TokenPath) == 2);
+        REQUIRE(fake.Param(TokenPath, "code") == "def");
+    }
+
+    const auto account = Nextendo::LoadAccount();
+    REQUIRE(account->scope == Nextendo::OnlineScopes);
+    REQUIRE(account->social_unavailable);
+    REQUIRE_FALSE(Nextendo::HasSocialScopes(*account));
+    REQUIRE(account->nex_token == "nx2.new");
+    const int hits = fake.TotalHits();
+    REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::MissingScope);
+    REQUIRE(Nextendo::UpdatePresence(ClientId, 0x0100152000022000).status ==
+            Nextendo::SocialStatus::MissingScope);
+    REQUIRE(fake.TotalHits() == hits);
+
+    FakeBrowser again{{"code=ghi"}};
+    REQUIRE(Nextendo::SignIn(ClientId, again.Opener(), {}).ok);
+    REQUIRE(again.scopes == std::vector<std::string>{FullScope});
+    REQUIRE(Nextendo::HasSocialScopes(*Nextendo::LoadAccount()));
+    REQUIRE_FALSE(Nextendo::LoadAccount()->social_unavailable);
+}
+
+TEST_CASE("Nextendo: a declined sign-in is not asked again", "[common]") {
+    FakeNextendo fake;
+    FakeBrowser browser{
+        {"error=access_denied&error_description=The%20player%20declined%20the%20scopes"}};
+    const auto result = Nextendo::SignIn(ClientId, browser.Opener(), {});
+    REQUIRE_FALSE(result.ok);
+    REQUIRE(result.error == "access_denied: The player declined the scopes");
+    REQUIRE(browser.scopes == std::vector<std::string>{FullScope});
+    REQUIRE(fake.TotalHits() == 0);
+}
+
+TEST_CASE("Nextendo: the BAAS user id is the account id only in Animal Crossing", "[common]") {
+    REQUIRE(Nextendo::ParseBaasNsa("0123456789abcDEF") == 0x0123456789ABCDEF);
+    REQUIRE(Nextendo::ParseBaasNsa("123456789abcdef") == 0);
+    REQUIRE(Nextendo::ParseBaasNsa("0123456789abcdeg") == 0);
+    REQUIRE(Nextendo::ParseBaasNsa("") == 0);
+
+    Nextendo::Account account{.pid = 1800000001, .baas_nsa = 0x0123456789ABCDEF};
+    REQUIRE(Nextendo::NetworkServiceAccountId(Nextendo::AnimalCrossingNewHorizons, account) ==
+            0x0123456789ABCDEF);
+    REQUIRE(Nextendo::NetworkServiceAccountId(0x0100152000022000, account) == 1800000001);
+    account.baas_nsa = 0;
+    REQUIRE(Nextendo::NetworkServiceAccountId(Nextendo::AnimalCrossingNewHorizons, account) ==
+            1800000001);
+}
+
+TEST_CASE("Nextendo: a game token renewal fetches the BAAS user id once", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+    fake.Answer("/api/me", 200, R"({"pid":1,"username":"tester","nsa":"0123456789abcdef"})");
+
+    Nextendo::SaveAccount(SignedIn(Nextendo::RenewAheadSeconds - 60, 30 * 60));
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->baas_nsa == 0x0123456789ABCDEF);
+    REQUIRE(fake.Authorization("/api/me") == "Bearer access.old");
+
+    auto renewed = *Nextendo::LoadAccount();
+    renewed.nex_expires = Now() + Nextendo::RenewAheadSeconds - 60;
+    Nextendo::SaveAccount(renewed);
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->baas_nsa == 0x0123456789ABCDEF);
+    REQUIRE(fake.Hits(NexTokenPath) == 2);
+    REQUIRE(fake.Hits("/api/me") == 1);
+}
+
+namespace {
+
+std::string Base64(std::span<const u8> data) {
+    std::string out(4 * ((data.size() + 2) / 3) + 1, '\0');
+    const int size = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), data.data(),
+                                     static_cast<int>(data.size()));
+    out.resize(static_cast<std::size_t>(size));
+    return out;
+}
+
+std::string Timestamp(s64 time) {
+    const std::time_t t = static_cast<std::time_t>(time);
+    std::array<char, 32> text{};
+    std::strftime(text.data(), text.size(), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return text.data();
+}
+
+// Signs catalogues with a key made for the test, the way nextendo.network signs its own.
+class CatalogSigner {
+public:
+    CatalogSigner() {
+        EVP_PKEY_CTX* const context = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+        REQUIRE(context != nullptr);
+        REQUIRE(EVP_PKEY_keygen_init(context) == 1);
+        REQUIRE(EVP_PKEY_keygen(context, &key) == 1);
+        EVP_PKEY_CTX_free(context);
+    }
+
+    ~CatalogSigner() {
+        EVP_PKEY_free(key);
+    }
+
+    std::string PublicKey() const {
+        std::array<u8, 32> raw{};
+        std::size_t size = raw.size();
+        REQUIRE(EVP_PKEY_get_raw_public_key(key, raw.data(), &size) == 1);
+        return Base64(raw);
+    }
+
+    std::string Sign(std::string_view payload, std::string_view key_id = "catalog-key-1") const {
+        std::array<u8, 64> signature{};
+        std::size_t size = signature.size();
+        EVP_MD_CTX* const context = EVP_MD_CTX_new();
+        REQUIRE(EVP_DigestSignInit(context, nullptr, nullptr, nullptr, key) == 1);
+        REQUIRE(EVP_DigestSign(context, signature.data(), &size,
+                               reinterpret_cast<const u8*>(payload.data()), payload.size()) == 1);
+        EVP_MD_CTX_free(context);
+        return fmt::format(R"({{"key_id":"{}","payload":"{}","signature":"{}"}})", key_id,
+                           Base64({reinterpret_cast<const u8*>(payload.data()), payload.size()}),
+                           Base64(signature));
+    }
+
+private:
+    EVP_PKEY* key{};
+};
+
+std::string CatalogPayload(s64 expires_at, std::string_view type = "game_catalog",
+                           int revision = 3) {
+    return fmt::format(
+        R"({{"document_type":"{}","schema_version":1,"revision":{},"issued_at":"{}",)"
+        R"("expires_at":"{}","games":[)"
+        R"({{"title_ids":["0100152000022000"],"name":"Mario Kart 8 Deluxe","enabled":true,)"
+        R"("protocol":"nex","required_capabilities":["versions.exact.v1"],)"
+        R"("versions":{{"policy":"exact","accepted":["4.0.1"],"recommended":"4.0.1"}}}},)"
+        R"({{"title_ids":["0100f8f0000a2000","01003BC0000A0000"],"name":"Splatoon 2",)"
+        R"("enabled":false,"protocol":"nex","required_capabilities":[]}},)"
+        R"({{"title_ids":["0100b0c013912000"],"name":"Among Us","enabled":true,)"
+        R"("protocol":"other","required_capabilities":["versions.any.v1"],)"
+        R"("versions":{{"policy":"any"}}}}]}})",
+        type, revision, Timestamp(expires_at - 86400), Timestamp(expires_at));
+}
+
+constexpr const char* FriendsPath = "/api/friends";
+constexpr const char* PresencePath = "/api/presence";
+constexpr const char* Friends =
+    R"({"friends":[{"pid":11,"username":"amy","name":"Amy","friend_code":"SW-1111-1111-1111",)"
+    R"("nsa":"00000000000000AB","pf":1,"favorite":true,"presence":{"status":2,"app_id":"0100152000022000",)"
+    R"("app_detail":"Racing","app_field":"S2V5AFZhbHVl"}},)"
+    R"({"pid":12,"username":"bob","presence":{"status":0}}],)"
+    R"("requests":[{"pid":13,"name":"Cat"}],"sent":[{"pid":14,"name":"Dan"},{"pid":0}]})";
+
+Nextendo::Account SocialSignedIn(s64 access_token_left = 30 * 60) {
+    auto account = SignedIn(2 * 60 * 60, access_token_left);
+    account.scope = std::string{Nextendo::Scopes};
+    return account;
+}
+
+} // namespace
+
+TEST_CASE("Nextendo: friend list", "[common]") {
+    const auto list = Nextendo::ParseFriendList(Friends);
+    REQUIRE(list.has_value());
+    REQUIRE(list->friends.size() == 2);
+    const auto& amy = list->friends[0];
+    REQUIRE(amy.pid == 11);
+    REQUIRE(amy.name == "Amy");
+    REQUIRE(amy.friend_code == "SW-1111-1111-1111");
+    REQUIRE(amy.nsa == 0xAB);
+    REQUIRE(amy.console);
+    REQUIRE(amy.favorite);
+    REQUIRE(amy.status == 2);
+    REQUIRE(amy.app_id == 0x0100152000022000);
+    REQUIRE(amy.app_detail == "Racing");
+    REQUIRE(amy.app_field == std::string("Key\0Value", 9));
+    REQUIRE(list->friends[1].name == "bob");
+    REQUIRE_FALSE(list->friends[1].console);
+    REQUIRE(list->requests.size() == 1);
+    REQUIRE(list->sent.size() == 1);
+    REQUIRE_FALSE(Nextendo::ParseFriendList("[]").has_value());
+}
+
+TEST_CASE("Nextendo: older sign-ins are asked to sign in again for friends", "[common]") {
+    FakeNextendo fake;
+    fake.Answer(NexTokenPath, 200, NewGameToken);
+    fake.Answer(FriendsPath, 200, Friends);
+
+    Nextendo::SaveAccount(SignedIn(60, -10));
+    REQUIRE_FALSE(Nextendo::HasSocialScopes(*Nextendo::LoadAccount()));
+    REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::MissingScope);
+    REQUIRE(fake.TotalHits() == 0);
+
+    // Online play keeps working, and a refresh that grants the scopes is kept.
+    fake.Answer(TokenPath, 200,
+                R"({"access_token":"access.new","refresh_token":"refresh.new","expires_in":3600,)"
+                R"("scope":"identity game.matchmaking friends presence"})");
+    REQUIRE(Nextendo::EnsureGameToken(ClientId)->nex_token == "nx2.new");
+    REQUIRE(Nextendo::HasSocialScopes(*Nextendo::LoadAccount()));
+}
+
+TEST_CASE("Nextendo: friends refresh with the access token", "[common]") {
+    SECTION("and are cached until a sign-out") {
+        FakeNextendo fake;
+        fake.Answer(FriendsPath, 200, Friends);
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::Ok);
+        REQUIRE(fake.Authorization(FriendsPath) == "Bearer access.old");
+        REQUIRE(fake.Param(FriendsPath, "images") == "0");
+        REQUIRE(Nextendo::CachedFriends().friends.size() == 2);
+        Nextendo::ClearAccount();
+        REQUIRE(Nextendo::CachedFriends().friends.empty());
+    }
+    SECTION("and are dropped when another sign-in replaces the account") {
+        FakeNextendo fake;
+        fake.Answer(FriendsPath, 200, Friends);
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::Ok);
+        Nextendo::SaveAccount(SignedIn(2 * 60 * 60, 30 * 60));
+        REQUIRE(Nextendo::CachedFriends().friends.empty());
+    }
+    SECTION("refreshing an access token about to expire") {
+        FakeNextendo fake;
+        fake.Answer(TokenPath, 200, NewAccessToken);
+        fake.Answer(FriendsPath, 200, Friends);
+
+        Nextendo::SaveAccount(SocialSignedIn(30));
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::Ok);
+        REQUIRE(fake.Hits(TokenPath) == 1);
+        REQUIRE(fake.Authorization(FriendsPath) == "Bearer access.new");
+    }
+    SECTION("a 401 refreshes the access token once") {
+        FakeNextendo fake;
+        fake.Answer(FriendsPath, 401, "{}");
+        fake.Answer(FriendsPath, 200, Friends);
+        fake.Answer(TokenPath, 200, NewAccessToken);
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::Ok);
+        REQUIRE(fake.Hits(TokenPath) == 1);
+        REQUIRE(fake.Hits(FriendsPath) == 2);
+        REQUIRE(fake.Authorization(FriendsPath) == "Bearer access.new");
+    }
+    SECTION("a second 401 stops asking until a new sign-in") {
+        FakeNextendo fake;
+        fake.Answer(FriendsPath, 401, "{}");
+        fake.Answer(TokenPath, 200, NewAccessToken);
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::MissingScope);
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::MissingScope);
+        REQUIRE(fake.Hits(TokenPath) == 1);
+        REQUIRE(fake.Hits(FriendsPath) == 2);
+        const auto account = Nextendo::LoadAccount();
+        REQUIRE(account.has_value());
+        REQUIRE_FALSE(Nextendo::HasSocialScopes(*account));
+    }
+    SECTION("a 403 is a missing scope, without a refresh") {
+        FakeNextendo fake;
+        fake.Answer(FriendsPath, 403, R"({"error":"insufficient_scope"})");
+        fake.Answer(PresencePath, 200, R"({"ok":true})");
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::RefreshFriends(ClientId).status == Nextendo::SocialStatus::MissingScope);
+        REQUIRE(fake.Hits(TokenPath) == 0);
+        REQUIRE(Nextendo::LoadAccount()->scope == "identity game.matchmaking presence");
+        REQUIRE(Nextendo::UpdatePresence(ClientId, 0x0100152000022000).status ==
+                Nextendo::SocialStatus::Ok);
+        REQUIRE(fake.Hits(PresencePath) == 1);
+    }
+    SECTION("friend requests post the pid") {
+        FakeNextendo fake;
+        fake.Answer("/api/friends/accept", 200, R"({"friend":{}})");
+
+        Nextendo::SaveAccount(SocialSignedIn());
+        REQUIRE(Nextendo::AnswerFriend(ClientId, Nextendo::FriendAction::Accept, 13).status ==
+                Nextendo::SocialStatus::Ok);
+        REQUIRE(nlohmann::json::parse(fake.Body("/api/friends/accept")) ==
+                nlohmann::json{{"pid", 13}});
+    }
+}
+
+TEST_CASE("Nextendo: presence", "[common]") {
+    using namespace std::chrono_literals;
+    const Nextendo::Presence playing{.status = 2, .app_id = 0x0100152000022000};
+    const Nextendo::Presence offline{};
+    const auto body = nlohmann::json::parse(Nextendo::PresenceBody(playing));
+    REQUIRE(body == nlohmann::json{
+                        {"status", 2}, {"app_id", "0100152000022000"}, {"platform", "emulator"}});
+
+    REQUIRE(Nextendo::PresenceDue(std::nullopt, 0s, playing));
+    REQUIRE_FALSE(Nextendo::PresenceDue(std::nullopt, 0s, offline));
+    REQUIRE_FALSE(Nextendo::PresenceDue(playing, 30s, playing));
+    REQUIRE(Nextendo::PresenceDue(playing, 60s, playing));
+    REQUIRE(Nextendo::PresenceDue(playing, 1s, offline));
+    REQUIRE_FALSE(Nextendo::PresenceDue(offline, 10min, offline));
+    auto changed = playing;
+    changed.app_field = "Mode";
+    REQUIRE_FALSE(Nextendo::PresenceDue(playing, 10s, changed));
+    REQUIRE(Nextendo::PresenceDue(playing, 30s, changed));
+
+    FakeNextendo fake;
+    fake.Answer(PresencePath, 200, R"({"ok":true})");
+    Nextendo::SaveAccount(SocialSignedIn());
+    Nextendo::SetGameAppField(playing.app_id, std::string(0xC0, '\0'));
+    REQUIRE(Nextendo::UpdatePresence(ClientId, playing.app_id).status ==
+            Nextendo::SocialStatus::Ok);
+    REQUIRE(nlohmann::json::parse(fake.Body(PresencePath)) == body);
+    REQUIRE(fake.Authorization(PresencePath) == "Bearer access.old");
+    REQUIRE(Nextendo::UpdatePresence(ClientId, playing.app_id).status ==
+            Nextendo::SocialStatus::Ok);
+    REQUIRE(fake.Hits(PresencePath) == 1);
+    REQUIRE(Nextendo::UpdatePresence(ClientId, 0).status == Nextendo::SocialStatus::Ok);
+    REQUIRE(fake.Hits(PresencePath) == 2);
+    REQUIRE(nlohmann::json::parse(fake.Body(PresencePath))["status"] == 0);
+}
+
+TEST_CASE("Nextendo: the game catalogue is checked before it is used", "[common]") {
+    const CatalogSigner signer;
+    const s64 now = Now();
+    const auto valid = signer.Sign(CatalogPayload(now + 3600));
+
+    const auto catalog = Nextendo::ParseGameCatalog(valid, signer.PublicKey(), now);
+    REQUIRE(catalog.has_value());
+    REQUIRE(catalog->revision == 3);
+    REQUIRE(catalog->titles.size() == 4);
+    REQUIRE(catalog->titles.at(0x01003BC0000A0000).enabled == false);
+
+    REQUIRE_FALSE(Nextendo::ParseGameCatalog(valid, Nextendo::GameCatalogKey, now).has_value());
+    REQUIRE_FALSE(Nextendo::ParseGameCatalog(signer.Sign(CatalogPayload(now + 3600), "other-key"),
+                                             signer.PublicKey(), now)
+                      .has_value());
+    REQUIRE_FALSE(Nextendo::ParseGameCatalog(valid, signer.PublicKey(), now + 3600).has_value());
+    REQUIRE_FALSE(Nextendo::ParseGameCatalog(signer.Sign(CatalogPayload(now + 3600, "npln")),
+                                             signer.PublicKey(), now)
+                      .has_value());
+    REQUIRE_FALSE(
+        Nextendo::ParseGameCatalog(signer.Sign(CatalogPayload(now + 3600, "game_catalog", 0)),
+                                   signer.PublicKey(), now)
+            .has_value());
+
+    std::string tampered = valid;
+    tampered[tampered.find("payload") + 12] ^= 1;
+    REQUIRE_FALSE(Nextendo::ParseGameCatalog(tampered, signer.PublicKey(), now).has_value());
+}
+
+TEST_CASE("Nextendo: game versions follow the catalogue's exact policy", "[common]") {
+    const CatalogSigner signer;
+    const auto catalog = *Nextendo::ParseGameCatalog(signer.Sign(CatalogPayload(Now() + 3600)),
+                                                     signer.PublicKey(), Now());
+    using Kind = Nextendo::VersionVerdict::Kind;
+    constexpr u64 Mk8dx = 0x0100152000022000;
+
+    REQUIRE(Nextendo::CheckGameVersion(catalog, Mk8dx, "4.0.1")->kind == Kind::Accepted);
+    REQUIRE(Nextendo::CheckGameVersion(catalog, Mk8dx, "4.0.1.0")->kind == Kind::Accepted);
+    const auto old = Nextendo::CheckGameVersion(catalog, Mk8dx, "4.0.0");
+    REQUIRE(old->kind == Kind::UpdateRequired);
+    REQUIRE(old->recommended == "4.0.1");
+    REQUIRE(Nextendo::CheckGameVersion(catalog, Mk8dx, "4.0.1.1")->kind == Kind::UpdateRequired);
+    REQUIRE(Nextendo::CheckGameVersion(catalog, 0x0100F8F0000A2000, "5.5.2")->kind ==
+            Kind::Disabled);
+    REQUIRE(Nextendo::CheckGameVersion(catalog, 0x0100B0C013912000, "2026.19.0")->kind ==
+            Kind::Accepted);
+    REQUIRE_FALSE(Nextendo::CheckGameVersion(catalog, 0x01006F8002326000, "3.0.3").has_value());
+    REQUIRE_FALSE(Nextendo::CheckGameVersion(catalog, Mk8dx, "").has_value());
+}
+
+TEST_CASE("Nextendo: the game catalogue is cached until it expires", "[common]") {
+    FakeNextendo fake;
+    const CatalogSigner signer;
+    Settings::values.nextendo_enabled = true;
+
+    fake.Answer("/service-catalog/v1/game-catalog", 200, "not signed");
+    fake.Answer("/service-catalog/v1/game-catalog", 200, signer.Sign(CatalogPayload(Now() + 3600)));
+    REQUIRE_FALSE(Nextendo::LoadGameCatalog(ClientId, signer.PublicKey()).has_value());
+    REQUIRE(Nextendo::LoadGameCatalog(ClientId, signer.PublicKey())->revision == 3);
+    REQUIRE(Nextendo::LoadGameCatalog(ClientId, signer.PublicKey())->revision == 3);
+    REQUIRE(fake.Hits("/service-catalog/v1/game-catalog") == 2);
+
+    Settings::values.nextendo_enabled = false;
+    REQUIRE_FALSE(Nextendo::LoadGameCatalog(ClientId, signer.PublicKey()).has_value());
 }

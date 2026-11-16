@@ -113,6 +113,10 @@ public:
 
     bool CanReportMemoryUsage() const;
 
+    /// The largest width and height a scaled image may take: the device's 2D image and
+    /// framebuffer limits (16384 on AMD).
+    u32 GetMaxScaledExtent() const noexcept;
+
     /// Images that did not fit the device memory budget so far (see MemoryAllocator).
     u32 MemoryPressureEvents() const noexcept {
         return memory_allocator.MemoryPressureEvents();

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,10 +31,16 @@ enum class Target {
 std::optional<Target> Classify(std::string_view host, u64 program_id = 0);
 
 // The address to resolve instead of host, or nullopt when host keeps its normal resolution.
+// In the order wiki.nextendo.network/integration gives: a literal address stays as it is, then
+// an exact entry of sdmc:/atmosphere/hosts/default.txt, the built-in rules, and the hosts file's
+// wildcard entries.
 std::optional<std::string> RedirectAddress(std::string_view host, u64 program_id = 0);
 
-// NSD names carry "%" for the environment; retail consoles resolve it to "lp1".
-std::string ExpandNsdHost(std::string host);
+// The name the console's NSD resolves host to: every "%" becomes the environment, "lp1". While
+// online play is on, the Nintendo Account names also become the BAAS application host.
+std::string ResolveFqdn(std::string host);
+
+std::optional<std::array<u8, 4>> ParseIPv4(std::string_view text);
 
 // Remembers which redirected name an address came from, so a TLS connection the guest opens by
 // address still sends that name as SNI: Nextendo routes its auth servers on :443 by SNI.

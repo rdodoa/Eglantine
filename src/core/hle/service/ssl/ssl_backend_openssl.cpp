@@ -213,7 +213,7 @@ public:
         // address itself; Nextendo needs the real name for SNI (citron-nextendo).
         std::string host = hostname_in;
         if (Common::Nextendo::OnlinePlayActive()) {
-            host = Sockets::Nextendo::ExpandNsdHost(std::move(host));
+            host = Sockets::Nextendo::ResolveFqdn(std::move(host));
         }
         if (Common::Nextendo::OnlinePlayActive() && socket) {
             const auto [peer, err] = socket->GetPeerName();
