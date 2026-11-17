@@ -1116,6 +1116,12 @@ FN_MAX_LIMIT_LIST
         return has_renderdoc || has_nsight_graphics || has_radeon_gpu_profiler;
     }
 
+    /// Whether resources get debug names: for an attached tool, or for the device address map
+    /// (EDEN_NX2_FAULT_MAP) to name what a fault hit.
+    bool NamesObjects() const {
+        return HasDebuggingToolAttached() || address_binding_report;
+    }
+
     /// Returns true when RADV saves a GPU hang report (RADV_DEBUG=hang), which keeps the SPIR-V of
     /// the pipelines bound at the hang.
     bool HasRadvHangReport() const {
@@ -1464,6 +1470,8 @@ private:
 
     VkPhysicalDeviceFeatures2 features2{};
     VkPhysicalDeviceFaultFeaturesEXT device_fault_features{};
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT address_binding_report_features{};
+    bool address_binding_report{};
     /// Enabled as the driver reports them (VK_KHR_portability_subset devices only).
     VkPhysicalDevicePortabilitySubsetFeaturesKHR portability_subset_features{};
     VkPhysicalDeviceProperties2 properties2{};

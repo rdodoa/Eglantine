@@ -449,6 +449,16 @@ TEST_CASE("NSP discovery skips unreadable NCA metadata", "[core][file_sys][nca_d
             auto base = MakeDiscoveryNca(TitleId, NcaHeader::ContentType::Program,
                                          MakePfs0WithFiles({{"main", {0}}}));
             Put(base, offsetof(NcaHeader, magic), NcaHeader::Magic3);
+            // Key generation 0 asked for master key 00's key area key, which key_derivation and
+            // keyblob_cmac leave derived in the KeyManager when they run first: take a generation
+            // no test derives.
+            constexpr u8 KeyGeneration = 0x10; // master key 0x0F
+            Put(base, offsetof(NcaHeader, key_generation), KeyGeneration);
+            if (Core::Crypto::KeyManager::Instance().HasKey(
+                    Core::Crypto::S128KeyType::KeyArea, KeyGeneration - 1,
+                    static_cast<u64>(Core::Crypto::KeyAreaKeyType::Application))) {
+                SKIP("A key area key for this key generation is loaded");
+            }
             REQUIRE(NCA{MakeFile(base)}.GetStatus() ==
                     Loader::ResultStatus::ErrorMissingKeyAreaKey);
             files.emplace_back(program_name, std::move(base));

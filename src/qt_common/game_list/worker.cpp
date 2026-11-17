@@ -57,37 +57,6 @@ struct PendingRow {
     }
 };
 
-QString GetGameListCachedObject(const std::string& filename, const std::string& ext,
-                                const std::function<QString()>& generator) {
-    if (!UISettings::values.cache_game_list || filename == "0000000000000000") {
-        return generator();
-    }
-
-    const auto path =
-        Common::FS::PathToUTF8String(Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                                     "game_list" / fmt::format("{}.{}", filename, ext));
-
-    void(Common::FS::CreateParentDirs(path));
-
-    if (!Common::FS::Exists(path)) {
-        const auto str = generator();
-
-        QFile file{QString::fromStdString(path)};
-        if (file.open(QFile::WriteOnly)) {
-            file.write(str.toUtf8());
-        }
-
-        return str;
-    }
-
-    QFile file{QString::fromStdString(path)};
-    if (file.open(QFile::ReadOnly)) {
-        return QString::fromUtf8(file.readAll());
-    }
-
-    return generator();
-}
-
 std::pair<std::vector<u8>, std::string> GetGameListCachedObject(
     const std::string& filename, const std::string& ext,
     const std::function<std::pair<std::vector<u8>, std::string>()>& generator) {
@@ -317,7 +286,8 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
                                         const std::size_t size, const std::vector<u8>& icon,
                                         Loader::AppLoader& loader, u64 program_id,
                                         const PlayTime::PlayTimeManager& play_time_manager,
-                                        const FileSys::PatchManager& patch) {
+                                        const FileSys::PatchManager& patch,
+                                        GameListPatchCache& patch_cache) {
     auto const file_type = loader.GetFileType();
     // Hortensia: name the console next to the file type. Switch 2 titles use program IDs starting
     // with 04, Switch 1 titles 01.
@@ -331,8 +301,8 @@ QList<QStandardItem*> MakeGameListEntry(const std::string& path, const std::stri
             : QStringLiteral("%1 · %2").arg(
                   platform_string, QString::fromStdString(Loader::GetFileTypeString(file_type)));
 
-    QString patch_versions = GetGameListCachedObject(
-        fmt::format("{:016X}", patch.GetTitleID()), "pv.txt", [&patch, &loader] {
+    QString patch_versions = patch_cache.Get(
+        patch.GetTitleID(), UISettings::values.cache_game_list.GetValue(), [&patch, &loader] {
             return FormatPatchNameVersions(patch, loader, loader.IsRomFSUpdatable());
         });
 
@@ -476,7 +446,7 @@ void GameListWorker::AddTitlesToGameList(GameListDir* parent_dir, GameListItemTy
         }
 
         auto entry = MakeGameListEntry(file->GetFullPath(), name, file->GetSize(), icon, *loader,
-                                       program_id, play_time_manager, patch);
+                                       program_id, play_time_manager, patch, patch_cache);
         auto pending = std::make_shared<PendingRow>(std::move(entry));
         RecordEvent([=](GameListModel* model) { model->AddEntry(pending->Release(), parent_dir); });
     }
@@ -597,7 +567,7 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
                 const u64 size = loose_dump ? 0 : Common::FS::GetSize(physical_name);
 
                 auto entry = MakeGameListEntry(physical_name, name, size, icon, *app_loader, id,
-                                               play_time_manager, patch);
+                                               play_time_manager, patch, patch_cache);
 
                 if (loose_dump) {
                     entry[GameListModel::COLUMN_SIZE]->setText(tr("Calculating..."));
@@ -654,6 +624,7 @@ void GameListWorker::run() {
     watch_list.clear();
     loose_dumps.clear();
     provider->ClearAllEntries();
+    patch_cache.Clear();
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
         auto pending = std::make_shared<std::unique_ptr<GameListDir>>(game_list_dir);
@@ -702,6 +673,7 @@ void GameListWorker::run() {
                      discovery.files.size(), discovery.directories.size(), discovery.skipped_romfs,
                      discovery.errors, stop_requested.load());
             ScanFileSystem(ScanTarget::FillManualContentProvider, discovery.files, game_list_dir);
+            patch_cache.Clear();
             ScanFileSystem(ScanTarget::PopulateGameList, discovery.files, game_list_dir);
         } else {
             AddTitlesToGameList(game_list_dir, parent_type);

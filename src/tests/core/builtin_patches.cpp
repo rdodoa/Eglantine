@@ -16,6 +16,7 @@
 #include "common/common_funcs.h"
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
@@ -1168,4 +1169,27 @@ TEST_CASE("Built-in FPS Unlock still applies beside a cheat that writes its cave
     const auto patched = context.Manager().PatchNSO(MakeDynamicMain(), "main");
     REQUIRE(WordAt(patched, HudHookOffset) == HudHookInstruction);
     REQUIRE(WordAt(patched, AmbientHookOffset) == AmbientHookInstruction);
+}
+
+TEST_CASE("Host redirect mods load only while the redirect is on", "[patch_manager]") {
+    PatchManagerTestContext context;
+    constexpr FileSys::PatchManager::BuildID TestBuildId{
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA,
+        0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34, 0x56, 0x78, 0x9A,
+    };
+    const auto exefs = Common::FS::GetEdenPath(Common::FS::EdenPath::LoadDir) /
+                       fmt::format("{:016X}", OtherTitleId) / "[Host redirect] Test server" /
+                       "exefs";
+    std::filesystem::create_directories(exefs);
+    WriteIps(exefs / fmt::format("{}.ips", Common::HexToString(TestBuildId)), BranchInstruction);
+
+    SCOPE_EXIT {
+        Settings::values.online_service_redirect = false;
+    };
+    Settings::values.online_service_redirect = false;
+    REQUIRE(PatchMain(context, TestBuildId, NopInstruction, "main", OtherTitleId) ==
+            NopInstruction);
+    Settings::values.online_service_redirect = true;
+    REQUIRE(PatchMain(context, TestBuildId, NopInstruction, "main", OtherTitleId) ==
+            BranchInstruction);
 }

@@ -1459,6 +1459,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         /// Older sessions' used pipelines in the prebuild, shown in the load's progress
         size_t older_used{};
         bool has_loaded{};
+        DriverBuildTimes driver_builds;
         std::unique_ptr<PipelineStatistics> statistics;
         /// Records the load never chooses, as in the old cache; begin is the index in records
         std::vector<VideoCommon::PipelineRecord> incomplete;
@@ -1748,8 +1749,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                         return {};
                     }
                     return [this, &state, &built_one, key, entry = std::move(entry)]() mutable {
+                        const auto begin = std::chrono::steady_clock::now();
                         entry.pipeline->Build();
+                        const auto elapsed = std::chrono::steady_clock::now() - begin;
                         std::scoped_lock driver_lock{state.mutex};
+                        state.driver_builds.Add(elapsed);
                         state.compute_built += entry.pipeline->IsBound() ? 1 : 0;
                         compute_cache.emplace(key, std::move(entry));
                         built_one();
@@ -1791,8 +1795,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                     }
                     return [this, &state, &built_one, key,
                             pipeline = std::move(pipeline)]() mutable {
+                        const auto begin = std::chrono::steady_clock::now();
                         pipeline->Build();
+                        const auto elapsed = std::chrono::steady_clock::now() - begin;
                         std::scoped_lock lock{state.mutex};
+                        state.driver_builds.Add(elapsed);
                         state.graphics_built += pipeline->Failed() ? 0 : 1;
                         graphics_cache.emplace(key, std::move(pipeline));
                         built_one();
@@ -1909,7 +1916,8 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             "Shader cache v2 boot load{}: {:.1f} s, {} of {} compute and {} of {} graphics "
             "pipelines built ({}{}), {} only older sessions used and {} more cached graphics "
             "pipelines skipped at boot, {} admitted for background prebuild (older sessions' "
-            "first, then newest first), {} left for their first draw (prebuild limit {})",
+            "first, then newest first), {} left for their first draw (prebuild limit {}); driver "
+            "build times: {}",
             stop_loading.stop_requested() ? " stopped" : "",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin).count(),
             state.compute_built, state.total - queued_graphics, state.graphics_built,
@@ -1917,7 +1925,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             build_all ? fmt::format(", {} more by build_all_cached_shaders", queued_spare) : "",
             older_admitted + older_left, skipped_pipelines, deferred_pipelines,
             older_left + skipped_pipelines - (deferred_pipelines - older_admitted),
-            prebuild_limit);
+            prebuild_limit, state.driver_builds.Summary());
     }
 
     std::vector<DuplicateGraphicsRecord> no_duplicates;
@@ -2435,12 +2443,12 @@ void PipelineCache::TickFrame() {
             LOG_INFO(Render_Vulkan,
                      "Background prebuild done {:.1f} s after the boot load began: {} built, {} "
                      "failed, {} taken by draws before they finished, {} built ones no draw has "
-                     "taken yet",
+                     "taken yet; driver build times: {}",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                    *prebuild_load_begin)
                          .count(),
                      outcome->built, outcome->failed, outcome->taken_unfinished,
-                     outcome->unclaimed);
+                     outcome->unclaimed, outcome->driver_builds.Summary());
             prebuild_load_begin.reset();
         }
     }
