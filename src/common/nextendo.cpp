@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include <fmt/format.h>
@@ -39,32 +40,52 @@ namespace Common::Nextendo {
 
 namespace {
 
+struct StoredAccount {
+    std::optional<Account> account;
+    bool loaded = false;
+    // Bumped by every sign-in and sign-out, so a renewal that started before one doesn't save
+    // over it.
+    u64 generation = 0;
+    SignOutReason sign_out_reason = SignOutReason::None;
+};
+
+// The friend list, presence and picture belong to the profile's account that fetched and sent
+// them.
+struct SocialCache {
+    FriendList friends;
+    // Refreshes started, and the one friends holds, so an older reply can't replace a newer one.
+    u64 refreshes = 0;
+    u64 friends_refresh = 0;
+    std::optional<Presence> last_presence;
+    std::chrono::steady_clock::time_point last_presence_time;
+    // The SHA-256 of the picture the last PullProfile returned.
+    std::optional<std::array<u8, SHA256_DIGEST_LENGTH>> avatar_hash;
+};
+
 std::mutex account_mutex;
-// Bumped by every sign-in and sign-out, so a renewal that started before one doesn't save over it.
-u64 account_generation = 0;
-std::optional<Account> cached_account;
-bool account_loaded = false;
+// By guest profile. Entries are never erased, so a profile's generation only grows.
+std::unordered_map<Common::UUID, StoredAccount> accounts;
 std::mutex refresh_mutex;
 std::optional<std::chrono::steady_clock::time_point> last_renewal_failure;
 std::mutex api_mutex;
 std::string api_base{ApiBase};
 std::deque<std::chrono::steady_clock::time_point> recent_requests;
 std::atomic_bool sign_in_running{false};
-SignOutReason sign_out_reason = SignOutReason::None;
 // Taken after account_mutex when both are held.
 std::mutex social_mutex;
-FriendList friend_cache;
-// Refreshes started, and the one friend_cache holds, so an older reply can't replace a newer one.
-u64 friend_refreshes = 0;
-u64 friend_cache_refresh = 0;
+std::unordered_map<Common::UUID, SocialCache> social_caches;
 u64 game_app_id = 0;
 std::string game_app_field;
-std::optional<Presence> last_presence;
-std::chrono::steady_clock::time_point last_presence_time;
 // One presence post at a time, so two can't both decide it is due.
 std::mutex presence_mutex;
 
-std::filesystem::path AccountPath() {
+std::filesystem::path AccountPath(const Common::UUID& profile) {
+    return FS::GetEdenPath(FS::EdenPath::ConfigDir) / "nextendo" /
+           fmt::format("{}.json", profile.FormattedString());
+}
+
+// Where builds before accounts per profile kept the only one.
+std::filesystem::path LegacyAccountPath() {
     return FS::GetEdenPath(FS::EdenPath::ConfigDir) / "nextendo_account.json";
 }
 
@@ -377,17 +398,18 @@ GameTokenReply FetchGameToken(ApiClient& api, std::string_view client_id, Accoun
     return GameTokenReply::Ok;
 }
 
-void ExpireGameToken(const std::string& nex_token);
+void ExpireGameToken(const Common::UUID& profile, const std::string& nex_token);
 
 // A 401 means the game token was ended before it expired, so the next renewal replaces it.
 std::optional<OnlineStatus> FetchOnlineStatus(ApiClient& api, std::string_view client_id,
+                                              const Common::UUID& profile,
                                               const std::string& nex_token) {
     const auto result = api.Get(OnlineStatusPath, BearerHeaders(client_id, nex_token));
     if (!result || result->status != 200) {
         LOG_WARNING(Common, "Nextendo online status request failed (HTTP {})",
                     result ? result->status : 0);
         if (result && result->status == 401) {
-            ExpireGameToken(nex_token);
+            ExpireGameToken(profile, nex_token);
         }
         return std::nullopt;
     }
@@ -417,14 +439,15 @@ void FetchUserInfo(ApiClient& api, std::string_view client_id, Account& account)
     }
 }
 
-std::optional<Account> LoadAccountLocked() {
-    if (account_loaded) {
-        return cached_account;
+std::optional<Account> LoadAccountLocked(const Common::UUID& profile) {
+    StoredAccount& stored = accounts[profile];
+    if (stored.loaded) {
+        return stored.account;
     }
-    account_loaded = true;
-    const std::string text = FS::ReadStringFromFile(AccountPath(), FS::FileType::TextFile);
+    stored.loaded = true;
+    const std::string text = FS::ReadStringFromFile(AccountPath(profile), FS::FileType::TextFile);
     if (text.empty()) {
-        return cached_account;
+        return stored.account;
     }
     try {
         const auto json = nlohmann::json::parse(text);
@@ -441,19 +464,49 @@ std::optional<Account> LoadAccountLocked() {
         account.social_unavailable = social_unavailable != json.end() &&
                                      social_unavailable->is_boolean() &&
                                      social_unavailable->get<bool>();
-        cached_account = std::move(account);
+        stored.account = std::move(account);
     } catch (const std::exception& e) {
         LOG_WARNING(Common, "Ignoring an unreadable Nextendo account file: {}", e.what());
     }
-    return cached_account;
+    return stored.account;
 }
 
 // The file holds the refresh token, so only its owner may read it. It is written beside the old
-// one and renamed over it, so a crash mid-write keeps the previous session. The session stays in
-// memory when the write fails, so a rotated refresh token isn't lost until Lichii exits.
-bool WriteAccountLocked(const Account& account) {
-    cached_account = account;
-    account_loaded = true;
+// one and renamed over it, so a crash mid-write keeps the previous session.
+bool WritePrivateFile(const std::filesystem::path& path, const std::string& text) {
+    auto temp = path;
+    temp += ".tmp";
+    void(FS::CreateParentDirs(path));
+    void(FS::WriteStringToFile(temp, FS::FileType::BinaryFile, ""));
+    std::error_code ec;
+    std::filesystem::permissions(temp,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace, ec);
+    // Close reports a write the buffer held back and the disk then refused. It also has to come
+    // before the removal below, which Windows refuses while the file is open.
+    FS::IOFile file{temp, FS::FileAccessMode::Write, FS::FileType::BinaryFile};
+    const bool written = file.WriteString(text) == text.size();
+    if (!file.Close() || !written) {
+        LOG_ERROR(Common, "Could not write the Nextendo account file");
+        void(FS::RemoveFile(temp));
+        return false;
+    }
+    std::filesystem::rename(temp, path, ec);
+    if (ec) {
+        LOG_ERROR(Common, "Could not replace the Nextendo account file: {}", ec.message());
+        void(FS::RemoveFile(temp));
+        return false;
+    }
+    return true;
+}
+
+// The session stays in memory when the write fails, so a rotated refresh token isn't lost until
+// Lichii exits.
+bool WriteAccountLocked(const Common::UUID& profile, const Account& account) {
+    StoredAccount& stored = accounts[profile];
+    stored.account = account;
+    stored.loaded = true;
     const std::string nsa = account.baas_nsa != 0 ? fmt::format("{:016x}", account.baas_nsa) : "";
     const std::string text = nlohmann::json{
         {"pid", account.pid},
@@ -468,67 +521,53 @@ bool WriteAccountLocked(const Account& account) {
         {"nsa", nsa},
         {"social_unavailable", account.social_unavailable},
     }.dump(2);
-    const auto path = AccountPath();
-    auto temp = path;
-    temp += ".tmp";
-    void(FS::CreateParentDirs(path));
-    void(FS::WriteStringToFile(temp, FS::FileType::BinaryFile, ""));
-    std::error_code ec;
-    std::filesystem::permissions(temp,
-                                 std::filesystem::perms::owner_read |
-                                     std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace, ec);
-    if (FS::WriteStringToFile(temp, FS::FileType::BinaryFile, text) != text.size()) {
-        LOG_ERROR(Common, "Could not write the Nextendo account file");
-        void(FS::RemoveFile(temp));
-        return false;
-    }
-    std::filesystem::rename(temp, path, ec);
-    if (ec) {
-        LOG_ERROR(Common, "Could not replace the Nextendo account file: {}", ec.message());
-        void(FS::RemoveFile(temp));
-        return false;
-    }
-    return true;
+    return WritePrivateFile(AccountPath(profile), text);
 }
 
-// The friend list and presence belong to the account that fetched and sent them.
-void NewAccountGenerationLocked() {
-    ++account_generation;
-    sign_out_reason = SignOutReason::None;
+void NewAccountGenerationLocked(const Common::UUID& profile) {
+    StoredAccount& stored = accounts[profile];
+    ++stored.generation;
+    stored.sign_out_reason = SignOutReason::None;
     std::scoped_lock lock{social_mutex};
-    friend_cache = {};
-    last_presence.reset();
+    SocialCache& social = social_caches[profile];
+    social.friends = {};
+    social.last_presence.reset();
+    social.avatar_hash.reset();
 }
 
-void ClearAccountLocked() {
-    NewAccountGenerationLocked();
-    void(FS::RemoveFile(AccountPath()));
-    cached_account.reset();
-    account_loaded = true;
+void ClearAccountLocked(const Common::UUID& profile) {
+    NewAccountGenerationLocked(profile);
+    void(FS::RemoveFile(AccountPath(profile)));
+    StoredAccount& stored = accounts[profile];
+    stored.account.reset();
+    stored.loaded = true;
 }
 
-bool SaveRenewedAccount(const Account& account, u64 generation) {
+u64 GenerationLocked(const Common::UUID& profile) {
+    return accounts[profile].generation;
+}
+
+bool SaveRenewedAccount(const Common::UUID& profile, const Account& account, u64 generation) {
     std::scoped_lock lock{account_mutex};
-    return generation == account_generation && WriteAccountLocked(account);
+    return generation == GenerationLocked(profile) && WriteAccountLocked(profile, account);
 }
 
-bool ClearRenewedAccount(u64 generation, SignOutReason reason) {
+bool ClearRenewedAccount(const Common::UUID& profile, u64 generation, SignOutReason reason) {
     std::scoped_lock lock{account_mutex};
-    if (generation != account_generation) {
+    if (generation != GenerationLocked(profile)) {
         return false;
     }
-    ClearAccountLocked();
-    sign_out_reason = reason;
+    ClearAccountLocked(profile);
+    accounts[profile].sign_out_reason = reason;
     return true;
 }
 
-void ExpireGameToken(const std::string& nex_token) {
+void ExpireGameToken(const Common::UUID& profile, const std::string& nex_token) {
     std::scoped_lock lock{account_mutex};
-    auto account = LoadAccountLocked();
+    auto account = LoadAccountLocked(profile);
     if (account && account->nex_token == nex_token && account->nex_expires != 0) {
         account->nex_expires = 0;
-        void(WriteAccountLocked(*account));
+        void(WriteAccountLocked(profile, *account));
     }
 }
 
@@ -540,11 +579,11 @@ bool RenewalBackingOff() {
 
 // Trades the refresh token for a new access token and saves both. Signs out when nextendo.network
 // refuses the refresh token; other failures back off for five minutes. Hold refresh_mutex.
-bool RefreshAccessToken(ApiClient& api, std::string_view client_id, Account& account,
-                        u64 generation, std::string& error) {
+bool RefreshAccessToken(ApiClient& api, std::string_view client_id, const Common::UUID& profile,
+                        Account& account, u64 generation, std::string& error) {
     if (account.refresh_token.empty()) {
         LOG_WARNING(Common, "The Nextendo session expired; sign in again");
-        ClearRenewedAccount(generation, SignOutReason::SessionExpired);
+        ClearRenewedAccount(profile, generation, SignOutReason::SessionExpired);
         return false;
     }
     const httplib::Params form{
@@ -557,7 +596,7 @@ bool RefreshAccessToken(ApiClient& api, std::string_view client_id, Account& acc
     if (!token) {
         if (result && RefreshTokenRejected(result->body)) {
             LOG_WARNING(Common, "nextendo.network refused the refresh token; signing out");
-            ClearRenewedAccount(generation, SignOutReason::SessionExpired);
+            ClearRenewedAccount(profile, generation, SignOutReason::SessionExpired);
         } else {
             last_renewal_failure = std::chrono::steady_clock::now();
         }
@@ -565,7 +604,7 @@ bool RefreshAccessToken(ApiClient& api, std::string_view client_id, Account& acc
     }
     ApplyTokens(account, *token);
     // The server retires the old refresh token a minute after handing out a new one.
-    if (!SaveRenewedAccount(account, generation) || account.access_token.empty()) {
+    if (!SaveRenewedAccount(profile, account, generation) || account.access_token.empty()) {
         last_renewal_failure = std::chrono::steady_clock::now();
         return false;
     }
@@ -577,15 +616,16 @@ struct Session {
     u64 generation{};
 };
 
-// The stored account, its access token refreshed first when it expires within a minute or is
+// The profile's account, its access token refreshed first when it expires within a minute or is
 // refused, the one a request just got a 401 for. nullopt once signed out.
-std::optional<Session> AccessSession(std::string_view client_id, std::string_view refused = {}) {
+std::optional<Session> AccessSession(std::string_view client_id, const Common::UUID& profile,
+                                     std::string_view refused = {}) {
     std::scoped_lock lock{refresh_mutex};
     std::optional<Session> session;
     {
         std::scoped_lock account_lock{account_mutex};
-        if (auto account = LoadAccountLocked()) {
-            session = Session{std::move(*account), account_generation};
+        if (auto account = LoadAccountLocked(profile)) {
+            session = Session{std::move(*account), GenerationLocked(profile)};
         }
     }
     if (!session || client_id.empty()) {
@@ -599,27 +639,27 @@ std::optional<Session> AccessSession(std::string_view client_id, std::string_vie
     }
     ApiClient api{5};
     std::string error;
-    if (!RefreshAccessToken(api, client_id, account, session->generation, error) &&
-        !LoadAccount()) {
+    if (!RefreshAccessToken(api, client_id, profile, account, session->generation, error) &&
+        !LoadAccount(profile)) {
         return std::nullopt;
     }
     return session;
 }
 
 // nextendo.network refused scope, so Lichii stops asking for it until the player signs in again.
-void DropScope(u64 generation, std::string_view scope) {
+void DropScope(const Common::UUID& profile, u64 generation, std::string_view scope) {
     std::scoped_lock lock{account_mutex};
-    auto account = LoadAccountLocked();
-    if (!account || generation != account_generation) {
+    auto account = LoadAccountLocked(profile);
+    if (!account || generation != GenerationLocked(profile)) {
         return;
     }
     std::vector<std::string_view> kept = ScopeWords(account->scope);
     std::erase(kept, scope);
     account->scope = fmt::format("{}", fmt::join(kept, " "));
-    void(WriteAccountLocked(*account));
+    void(WriteAccountLocked(profile, *account));
     if (scope == "friends") {
         std::scoped_lock social_lock{social_mutex};
-        friend_cache = {};
+        social_caches[profile].friends = {};
     }
 }
 
@@ -627,19 +667,20 @@ using SocialSend = std::function<httplib::Result(ApiClient&, const httplib::Head
 
 // Sends a request that needs scope with the access token, and again with a new access token after
 // a 401. A 401 with the new token or a 403 means the sign-in lacks the scope.
-SocialResult SendSocial(std::string_view client_id, std::string_view scope, const SocialSend& send,
+SocialResult SendSocial(std::string_view client_id, const Common::UUID& profile,
+                        std::string_view scope, const SocialSend& send,
                         std::string* body = nullptr) {
-    if (const auto stored = LoadAccount(); !stored || !HasScope(stored->scope, scope)) {
+    if (const auto stored = LoadAccount(profile); !stored || !HasScope(stored->scope, scope)) {
         return {.status = stored ? SocialStatus::MissingScope : SocialStatus::NotSignedIn};
     }
-    auto session = AccessSession(client_id);
+    auto session = AccessSession(client_id, profile);
     if (!session) {
         return {.status = SocialStatus::NotSignedIn};
     }
     ApiClient api{5};
     auto result = send(api, BearerHeaders(client_id, session->account.access_token));
     if (result && result->status == 401) {
-        auto renewed = AccessSession(client_id, session->account.access_token);
+        auto renewed = AccessSession(client_id, profile, session->account.access_token);
         if (!renewed) {
             return {.status = SocialStatus::NotSignedIn, .http_status = 401};
         }
@@ -664,7 +705,7 @@ SocialResult SendSocial(std::string_view client_id, std::string_view scope, cons
                     "nextendo.network refused a {} request (HTTP {}); sign in again to "
                     "allow it",
                     scope, status);
-        DropScope(session->generation, scope);
+        DropScope(profile, session->generation, scope);
         return {.status = SocialStatus::MissingScope, .http_status = status};
     }
     if (status != 200) {
@@ -742,25 +783,48 @@ void SetApiBaseForTests(std::string base) {
     last_renewal_failure.reset();
 }
 
-std::optional<Account> LoadAccount() {
+std::optional<Account> LoadAccount(const Common::UUID& profile) {
     std::scoped_lock lock{account_mutex};
-    return LoadAccountLocked();
+    return LoadAccountLocked(profile);
 }
 
-void SaveAccount(const Account& account) {
+void SaveAccount(const Common::UUID& profile, const Account& account) {
     std::scoped_lock lock{account_mutex};
-    NewAccountGenerationLocked();
-    void(WriteAccountLocked(account));
+    NewAccountGenerationLocked(profile);
+    void(WriteAccountLocked(profile, account));
 }
 
-void ClearAccount() {
+void ClearAccount(const Common::UUID& profile) {
     std::scoped_lock lock{account_mutex};
-    ClearAccountLocked();
+    ClearAccountLocked(profile);
 }
 
-SignOutReason LastSignOutReason() {
+void MigrateAccountFile(const Common::UUID& profile) {
+    if (profile.IsInvalid()) {
+        return;
+    }
     std::scoped_lock lock{account_mutex};
-    return sign_out_reason;
+    const auto legacy = LegacyAccountPath();
+    const std::string text = FS::ReadStringFromFile(legacy, FS::FileType::TextFile);
+    if (text.empty() || FS::Exists(AccountPath(profile))) {
+        return;
+    }
+    if (!WritePrivateFile(AccountPath(profile), text)) {
+        return;
+    }
+    // A legacy file left behind would be copied again to whichever profile is current next time.
+    if (!FS::RemoveFile(legacy)) {
+        LOG_ERROR(Common, "Could not remove the old Nextendo account file");
+        void(FS::RemoveFile(AccountPath(profile)));
+        return;
+    }
+    accounts[profile].loaded = false;
+    LOG_INFO(Common, "Moved the Nextendo account to profile {}", profile.FormattedString());
+}
+
+SignOutReason LastSignOutReason(const Common::UUID& profile) {
+    std::scoped_lock lock{account_mutex};
+    return accounts[profile].sign_out_reason;
 }
 
 u64 NetworkServiceAccountId(u64 program_id, const Account& account) {
@@ -894,9 +958,8 @@ std::optional<OnlineStatus> ParseOnlineStatus(std::string_view body) {
     }
 }
 
-SignInResult SignIn(std::string_view client_id,
-                    const std::function<void(const std::string&)>& open_url,
-                    std::stop_token stop) {
+SignInResult SignIn(std::string_view client_id, const Common::UUID& profile,
+                    const std::function<void(const std::string&)>& open_url, std::stop_token stop) {
     SignInResult out;
     if (client_id.empty()) {
         out.error = "No Nextendo client id is set.";
@@ -1058,26 +1121,26 @@ SignInResult SignIn(std::string_view client_id,
                     out.game_token_error);
     }
     if (!account.nex_token.empty()) {
-        out.online_status = FetchOnlineStatus(api, client_id, account.nex_token);
+        out.online_status = FetchOnlineStatus(api, client_id, profile, account.nex_token);
     }
 
     if (!account.access_token.empty()) {
         FetchUserInfo(api, client_id, account);
     }
 
-    SaveAccount(account);
+    SaveAccount(profile, account);
     out.ok = true;
     return out;
 }
 
-std::optional<Account> EnsureGameToken(std::string_view client_id) {
+std::optional<Account> EnsureGameToken(std::string_view client_id, const Common::UUID& profile) {
     std::scoped_lock lock{refresh_mutex};
     std::optional<Account> account;
     u64 generation;
     {
         std::scoped_lock account_lock{account_mutex};
-        account = LoadAccountLocked();
-        generation = account_generation;
+        account = LoadAccountLocked(profile);
+        generation = GenerationLocked(profile);
     }
     const s64 now = Now();
     if (!account || client_id.empty() ||
@@ -1094,13 +1157,13 @@ std::optional<Account> EnsureGameToken(std::string_view client_id) {
     ApiClient api{5};
     std::string error;
     const auto refresh = [&] {
-        return RefreshAccessToken(api, client_id, *account, generation, error);
+        return RefreshAccessToken(api, client_id, profile, *account, generation, error);
     };
 
     bool refreshed = false;
     if (account->access_token.empty() || account->access_expires <= now + 60) {
         if (!refresh()) {
-            return LoadAccount();
+            return LoadAccount(profile);
         }
         refreshed = true;
     }
@@ -1108,7 +1171,7 @@ std::optional<Account> EnsureGameToken(std::string_view client_id) {
     if (reply == GameTokenReply::Unauthorized && !refreshed) {
         // The access token was ended early; a new one from the refresh token may still work.
         if (!refresh()) {
-            return LoadAccount();
+            return LoadAccount(profile);
         }
         reply = FetchGameToken(api, client_id, *account, error);
     }
@@ -1117,7 +1180,7 @@ std::optional<Account> EnsureGameToken(std::string_view client_id) {
         if (account->baas_nsa == 0) {
             FetchUserInfo(api, client_id, *account);
         }
-        void(SaveRenewedAccount(*account, generation));
+        void(SaveRenewedAccount(profile, *account, generation));
         break;
     case GameTokenReply::Failed:
         last_renewal_failure = std::chrono::steady_clock::now();
@@ -1125,24 +1188,25 @@ std::optional<Account> EnsureGameToken(std::string_view client_id) {
         break;
     case GameTokenReply::Unauthorized:
         LOG_WARNING(Common, "nextendo.network refused a new access token; signing out");
-        ClearRenewedAccount(generation, SignOutReason::SessionRevoked);
+        ClearRenewedAccount(profile, generation, SignOutReason::SessionRevoked);
         break;
     case GameTokenReply::MissingScope:
         LOG_WARNING(Common, "The Nextendo sign-in lacks game.matchmaking; signing out");
-        ClearRenewedAccount(generation, SignOutReason::MissingScope);
+        ClearRenewedAccount(profile, generation, SignOutReason::MissingScope);
         break;
     }
     // What is stored now, which a sign-in or sign-out during the requests may have replaced.
-    return LoadAccount();
+    return LoadAccount(profile);
 }
 
-std::optional<OnlineStatus> CheckOnlineStatus(std::string_view client_id) {
-    const auto account = EnsureGameToken(client_id);
+std::optional<OnlineStatus> CheckOnlineStatus(std::string_view client_id,
+                                              const Common::UUID& profile) {
+    const auto account = EnsureGameToken(client_id, profile);
     if (!account || account->nex_token.empty()) {
         return std::nullopt;
     }
     ApiClient api{5};
-    return FetchOnlineStatus(api, client_id, account->nex_token);
+    return FetchOnlineStatus(api, client_id, profile, account->nex_token);
 }
 
 std::optional<std::string> FetchGameCatalog(std::string_view client_id) {
@@ -1166,22 +1230,22 @@ void RevokeToken(std::string_view client_id, const std::string& refresh_token) {
     }
 }
 
-SignOutReason KeepSessionAlive(std::string_view client_id) {
+SignOutReason KeepSessionAlive(std::string_view client_id, const Common::UUID& profile) {
     u64 generation;
     {
         std::scoped_lock lock{account_mutex};
-        if (!LoadAccountLocked()) {
+        if (!LoadAccountLocked(profile)) {
             return SignOutReason::None;
         }
-        generation = account_generation;
+        generation = GenerationLocked(profile);
     }
-    void(EnsureGameToken(client_id));
+    void(EnsureGameToken(client_id, profile));
     std::optional<Account> account;
     {
         std::scoped_lock lock{account_mutex};
-        account = LoadAccountLocked();
-        if (generation != account_generation) {
-            return account ? SignOutReason::None : sign_out_reason;
+        account = LoadAccountLocked(profile);
+        if (generation != GenerationLocked(profile)) {
+            return account ? SignOutReason::None : accounts[profile].sign_out_reason;
         }
     }
     if (!account || account->nex_token.empty()) {
@@ -1194,14 +1258,14 @@ SignOutReason KeepSessionAlive(std::string_view client_id) {
         LOG_WARNING(Common, "Nextendo session heartbeat failed (HTTP {})",
                     touched ? touched->status : 0);
         if (touched && touched->status == 401) {
-            ExpireGameToken(account->nex_token);
+            ExpireGameToken(profile, account->nex_token);
             return SignOutReason::None;
         }
     }
     const auto status = api.Get(SessionStatusPath, headers);
     if (!status || status->status != 200) {
         if (status && status->status == 401) {
-            ExpireGameToken(account->nex_token);
+            ExpireGameToken(profile, account->nex_token);
         }
         return SignOutReason::None;
     }
@@ -1216,7 +1280,7 @@ SignOutReason KeepSessionAlive(std::string_view client_id) {
         return SignOutReason::None;
     }
     LOG_WARNING(Common, "nextendo.network ended this device's session; signing out");
-    return ClearRenewedAccount(generation, SignOutReason::SessionRevoked)
+    return ClearRenewedAccount(profile, generation, SignOutReason::SessionRevoked)
                ? SignOutReason::SessionRevoked
                : SignOutReason::None;
 }
@@ -1252,17 +1316,17 @@ std::optional<FriendList> ParseFriendList(std::string_view body) {
     }
 }
 
-SocialResult RefreshFriends(std::string_view client_id) {
+SocialResult RefreshFriends(std::string_view client_id, const Common::UUID& profile) {
     u64 generation;
     u64 refresh;
     {
         std::scoped_lock lock{account_mutex, social_mutex};
-        generation = account_generation;
-        refresh = ++friend_refreshes;
+        generation = GenerationLocked(profile);
+        refresh = ++social_caches[profile].refreshes;
     }
     std::string body;
     const auto result = SendSocial(
-        client_id, "friends",
+        client_id, profile, "friends",
         [](ApiClient& api, const httplib::Headers& headers) {
             return api.Get(fmt::format("{}?images=0", FriendsPath), headers);
         },
@@ -1276,36 +1340,40 @@ SocialResult RefreshFriends(std::string_view client_id) {
         return {.status = SocialStatus::Failed, .http_status = result.http_status};
     }
     std::scoped_lock lock{account_mutex, social_mutex};
+    SocialCache& social = social_caches[profile];
     // A sign-in, or a 403 that dropped the scope, while the list was on its way.
-    if (const auto account = LoadAccountLocked(); generation == account_generation && account &&
-                                                  HasScope(account->scope, "friends") &&
-                                                  refresh > friend_cache_refresh) {
-        friend_cache = std::move(*list);
-        friend_cache_refresh = refresh;
+    if (const auto account = LoadAccountLocked(profile);
+        generation == GenerationLocked(profile) && account && HasScope(account->scope, "friends") &&
+        refresh > social.friends_refresh) {
+        social.friends = std::move(*list);
+        social.friends_refresh = refresh;
     }
     return result;
 }
 
-FriendList CachedFriends() {
+FriendList CachedFriends(const Common::UUID& profile) {
     std::scoped_lock lock{social_mutex};
-    return friend_cache;
+    const auto it = social_caches.find(profile);
+    return it == social_caches.end() ? FriendList{} : it->second.friends;
 }
 
-SocialResult AddFriend(std::string_view client_id, std::string_view friend_code) {
+SocialResult AddFriend(std::string_view client_id, const Common::UUID& profile,
+                       std::string_view friend_code) {
     const std::string body = nlohmann::json{{"friend_code", friend_code}}.dump();
-    return SendSocial(client_id, "friends",
+    return SendSocial(client_id, profile, "friends",
                       [&body](ApiClient& api, const httplib::Headers& headers) {
                           return api.PostJson(FriendsPath, headers, body);
                       });
 }
 
-SocialResult AnswerFriend(std::string_view client_id, FriendAction action, u64 pid) {
+SocialResult AnswerFriend(std::string_view client_id, const Common::UUID& profile,
+                          FriendAction action, u64 pid) {
     const char* verb = action == FriendAction::Accept    ? "accept"
                        : action == FriendAction::Decline ? "decline"
                                                          : "remove";
     const std::string path = fmt::format("{}/{}", FriendsPath, verb);
     const std::string body = nlohmann::json{{"pid", pid}}.dump();
-    return SendSocial(client_id, "friends",
+    return SendSocial(client_id, profile, "friends",
                       [&path, &body](ApiClient& api, const httplib::Headers& headers) {
                           return api.PostJson(path, headers, body);
                       });
@@ -1346,7 +1414,7 @@ void SetGameAppField(u64 app_id, std::string app_field) {
     game_app_field = std::move(app_field);
 }
 
-SocialResult UpdatePresence(std::string_view client_id, u64 app_id) {
+SocialResult UpdatePresence(std::string_view client_id, const Common::UUID& profile, u64 app_id) {
     std::scoped_lock send_lock{presence_mutex};
     Presence next{.status = app_id != 0 ? 2 : 0, .app_id = app_id};
     std::optional<Presence> last;
@@ -1355,27 +1423,81 @@ SocialResult UpdatePresence(std::string_view client_id, u64 app_id) {
     u64 generation;
     {
         std::scoped_lock lock{account_mutex, social_mutex};
-        generation = account_generation;
+        generation = GenerationLocked(profile);
         if (app_id != 0 && app_id == game_app_id) {
             next.app_field = game_app_field;
         }
-        last = last_presence;
-        since_last = now - last_presence_time;
+        const SocialCache& social = social_caches[profile];
+        last = social.last_presence;
+        since_last = now - social.last_presence_time;
     }
     if (!PresenceDue(last, since_last, next)) {
         return {.status = SocialStatus::Ok};
     }
     const std::string body = PresenceBody(next);
-    const auto result =
-        SendSocial(client_id, "presence", [&body](ApiClient& api, const httplib::Headers& headers) {
-            return api.PostJson(PresencePath, headers, body);
-        });
+    const auto result = SendSocial(client_id, profile, "presence",
+                                   [&body](ApiClient& api, const httplib::Headers& headers) {
+                                       return api.PostJson(PresencePath, headers, body);
+                                   });
     std::scoped_lock lock{account_mutex, social_mutex};
-    if (result.status == SocialStatus::Ok && generation == account_generation) {
-        last_presence = std::move(next);
-        last_presence_time = now;
+    if (result.status == SocialStatus::Ok && generation == GenerationLocked(profile)) {
+        SocialCache& social = social_caches[profile];
+        social.last_presence = std::move(next);
+        social.last_presence_time = now;
     }
     return result;
+}
+
+std::string ProfileNickname(std::string_view username, std::size_t size) {
+    if (username.size() <= size) {
+        return std::string{username};
+    }
+    while (size > 0 && (static_cast<u8>(username[size]) & 0xC0) == 0x80) {
+        --size;
+    }
+    return std::string{username.substr(0, size)};
+}
+
+std::optional<ProfilePull> PullProfile(std::string_view client_id, const UUID& profile,
+                                       bool force) {
+    if (!OnlinePlayActive() || !Settings::values.nextendo_sync_profile.GetValue()) {
+        return std::nullopt;
+    }
+    std::optional<Account> account;
+    u64 generation;
+    {
+        std::scoped_lock lock{account_mutex};
+        account = LoadAccountLocked(profile);
+        generation = GenerationLocked(profile);
+    }
+    if (!account) {
+        return std::nullopt;
+    }
+    ProfilePull pull{.nickname = account->username};
+    ApiClient api{5};
+    // Public, so the request carries no token.
+    auto result = api.Get(fmt::format("/api/avatar?pid={}", account->pid), BaseHeaders(client_id));
+    if (!result || result->status != 200) {
+        LOG_WARNING(Common, "Could not fetch the Nextendo profile picture: {}",
+                    result ? fmt::format("HTTP {}", result->status)
+                           : httplib::to_string(result.error()));
+    }
+    std::scoped_lock lock{account_mutex, social_mutex};
+    if (generation != GenerationLocked(profile)) {
+        return std::nullopt;
+    }
+    if (!result || result->status != 200) {
+        return pull;
+    }
+    std::array<u8, SHA256_DIGEST_LENGTH> hash;
+    SHA256(reinterpret_cast<const u8*>(result->body.data()), result->body.size(), hash.data());
+    auto& last_hash = social_caches[profile].avatar_hash;
+    if (!force && last_hash == hash) {
+        return pull;
+    }
+    last_hash = hash;
+    pull.avatar = std::move(result->body);
+    return pull;
 }
 
 } // namespace Common::Nextendo

@@ -19,6 +19,7 @@
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/acc/errors.h"
+#include "core/hle/service/acc/nextendo_id_token.h"
 #include "core/hle/service/friend/friend.h"
 #include "core/hle/service/friend/friend_interface.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -126,12 +127,13 @@ constexpr std::array<u8, 667> DefaultFriendIcon{
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xD9};
 
-// The friend list while Nextendo online play is on, read from the cache the frontend refreshes.
-std::vector<Common::Nextendo::Friend> Friends() {
+// The friend list of the game's profile while Nextendo online play is on, read from the cache
+// the frontend refreshes.
+std::vector<Common::Nextendo::Friend> Friends(const Core::System& system) {
     if (!Common::Nextendo::OnlinePlayActive()) {
         return {};
     }
-    return Common::Nextendo::CachedFriends().friends;
+    return Common::Nextendo::CachedFriends(Account::Nextendo::CurrentProfile(system)).friends;
 }
 
 bool WantsNsaIds(Core::System& system) {
@@ -381,7 +383,7 @@ private:
     // conditions don't narrow the list.
     std::vector<Common::Nextendo::Friend> FilteredFriends(const SizedFriendFilter& filter) {
         const u64 program_id = system.GetApplicationProcessProgramID();
-        auto friends = Friends();
+        auto friends = Friends(system);
         std::erase_if(friends, [&filter, program_id](const Common::Nextendo::Friend& entry) {
             const bool presence =
                 filter.presence == PresenceFilter::Online               ? entry.status == 1
@@ -397,6 +399,7 @@ private:
     void GetFriendListIds(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const auto offset = rp.Pop<u32>();
+        rp.Skip(1, false); // Padding: the Uid that follows is 8-byte aligned
         [[maybe_unused]] const auto uuid = rp.PopRaw<Common::UUID>();
         const auto friends = FilteredFriends(rp.PopRaw<SizedFriendFilter>());
         const bool want_nsa = WantsNsaIds(system);
@@ -418,6 +421,7 @@ private:
     void GetFriendList(HLERequestContext& ctx) {
         IPC::RequestParser rp{ctx};
         const auto offset = rp.Pop<u32>();
+        rp.Skip(1, false); // Padding: the Uid that follows is 8-byte aligned
         const auto uuid = rp.PopRaw<Common::UUID>();
         const auto friends = FilteredFriends(rp.PopRaw<SizedFriendFilter>());
         const bool want_nsa = WantsNsaIds(system);
@@ -442,7 +446,7 @@ private:
     // One record per requested id, in order; an unknown id gets a zeroed (invalid) record.
     void WriteFriendInfo(HLERequestContext& ctx, const Common::UUID* owner) {
         const auto ids = RequestedIds(ctx);
-        const auto friends = Friends();
+        const auto friends = Friends(system);
         const u64 program_id = system.GetApplicationProcessProgramID();
         std::vector<FriendImpl> info(
             std::min(ids.size(), ctx.GetWriteBufferNumElements<FriendImpl>()));
@@ -485,9 +489,9 @@ private:
     // Names the signed-in account and its friends; other ids get a zeroed record.
     void GetProfileList(HLERequestContext& ctx) {
         const auto ids = RequestedIds(ctx);
-        const auto friends = Friends();
+        const auto friends = Friends(system);
         const auto account =
-            Common::Nextendo::OnlinePlayActive() ? Common::Nextendo::LoadAccount() : std::nullopt;
+            Account::Nextendo::LinkedAccount(Account::Nextendo::CurrentProfile(system));
         std::vector<ProfileImpl> profiles(
             std::min(ids.size(), ctx.GetWriteBufferNumElements<ProfileImpl>()));
         u32 resolved = 0;
@@ -618,7 +622,7 @@ private:
     }
 
     void GetFriendListForViewer(HLERequestContext& ctx) {
-        const auto friends = Friends();
+        const auto friends = Friends(system);
         std::vector<u64> ids;
         for (const auto& entry : friends) {
             if (ids.size() >= ctx.GetWriteBufferNumElements<u64>()) {
@@ -681,7 +685,7 @@ private:
         setting.friend_code_next_issuable_time = 99999999999;
         std::string_view friend_code = "0000-0000-0000";
         const auto account =
-            Common::Nextendo::OnlinePlayActive() ? Common::Nextendo::LoadAccount() : std::nullopt;
+            Account::Nextendo::LinkedAccount(Account::Nextendo::CurrentProfile(system));
         if (account && !account->friend_code.empty()) {
             // Nextendo codes read SW-0000-0000-0000; the console shows the digits.
             friend_code = account->friend_code;
