@@ -45,6 +45,7 @@ Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Ea
 | 010051F0207B2000 | Tomodachi Life: Living the Dream (Switch 1) |
 | 01006BB00C6F0000 | The Legend of Zelda: Link's Awakening (Switch 1) |
 | 01003EC027CC8000 | Deep Rock Galactic: Survivor (Switch 1) |
+| 01001F5010DFA000 | Pokémon Legends: Arceus (Switch 1) |
 
 Add ids here when a report identifies a new game.
 
