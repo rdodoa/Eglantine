@@ -33,6 +33,7 @@ add_executable(tests
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/home_menu.cpp
+    core/native_home_bootstrap.cpp
     core/kernel_finish_termination.cpp
     core/nx2_thread_stats.cpp
     core/nx2_debug_server.cpp
@@ -106,6 +107,8 @@ add_executable(tests
     core/ncz_io_guards.cpp
     core/ncz_container.cpp
     core/file_sys_parsers.cpp
+    core/nca_header_authentication.cpp
+    core/system_data_view.cpp
     input_common/calibration_lifetime.cpp
     video_core/ampere_logged_numeric.cpp
     video_core/ampere_logged_textures.cpp
