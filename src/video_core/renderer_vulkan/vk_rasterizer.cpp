@@ -2545,24 +2545,28 @@ void RasterizerVulkan::DispatchCompute() {
     };
     const auto indirect_address = kepler_compute->GetIndirectComputeAddress();
     const auto list_slot = kepler_compute->GetIndirectListSlot();
-    // The full-size 1080p pass is replaced only by FSR (native AA); DLAA through it is untested.
-    const auto oot_pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash());
-    const bool can_replace = OcarinaTemporalEnabled() &&
-                             oot_pass != VideoCommon::OcarinaUpscalePass::None &&
-                             pipeline->CanReplaceOcarinaUpscale() &&
-                             (oot_pass != VideoCommon::OcarinaUpscalePass::FullSize ||
-                              oot_backend == VideoCommon::OcarinaUpscaleBackend::Fsr) &&
-                             !indirect_address && !list_slot && !frame_dump.Capturing();
+    const bool can_replace =
+        OcarinaTemporalEnabled() &&
+        VideoCommon::FindOcarinaUpscalePass(native_key, pipeline->ShaderHash()) !=
+            VideoCommon::OcarinaUpscalePass::None &&
+        pipeline->CanReplaceOcarinaUpscale() && !indirect_address && !list_slot &&
+        !frame_dump.Capturing();
     // Until a dispatch overwrites the scene, each direct one binds only after the effects are
     // marked. The indirect path records its bind at once.
     const bool marking_effects = oot_effects_frame == render_trace_frame &&
                                  OcarinaTemporalEnabled() && !indirect_address && !list_slot &&
                                  !frame_dump.Capturing();
     ComputePipeline::BindCommand deferred_bind;
-    if (!pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
-                             texture_cache, texture_cache_runtime, byte_addressed_shadow,
-                             can_replace || marking_effects ? &deferred_bind : nullptr)) {
+    switch (pipeline->Configure(*kepler_compute, *gpu_memory, scheduler, buffer_cache,
+                                texture_cache, texture_cache_runtime, pipeline_cache,
+                                byte_addressed_shadow,
+                                can_replace || marking_effects ? &deferred_bind : nullptr)) {
+    case ComputePipeline::ConfigureResult::Ready:
+        break;
+    case ComputePipeline::ConfigureResult::Failed:
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
+        return;
+    case ComputePipeline::ConfigureResult::Skipped:
         return;
     }
     SCOPE_EXIT {
@@ -3568,9 +3572,19 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         !gpu_memory->IsContinuousRange(binding.address, VideoCommon::OcarinaCameraBytes)) {
         return;
     }
+    const auto refuse = [&](const char* reason, f32 width, f32 height) {
+        if (oot_camera_refusal && oot_camera_refusal->frame == render_trace_frame &&
+            u64{color.size.width} * color.size.height <
+                u64{oot_camera_refusal->target_width} * oot_camera_refusal->target_height) {
+            return;
+        }
+        oot_camera_refusal = OcarinaCameraRefusal{render_trace_frame, reason, width, height,
+                                                  color.size.width, color.size.height};
+    };
     const auto device_address = gpu_memory->GpuToCpuAddress(binding.address);
     if (!device_address ||
         buffer_cache.IsRegionGpuModified(*device_address, VideoCommon::OcarinaCameraBytes)) {
+        refuse("no scene camera: its buffer is GPU-written", 0.0f, 0.0f);
         return;
     }
     VideoCommon::OcarinaCameraBuffer values;
@@ -3579,6 +3593,10 @@ void RasterizerVulkan::TrackOcarinaCamera() {
         values, color.size.width, color.size.height,
         oot_backend == VideoCommon::OcarinaUpscaleBackend::Dlss);
     if (camera.issue != VideoCommon::OcarinaCameraIssue::None) {
+        refuse(camera.issue == VideoCommon::OcarinaCameraIssue::Extent
+                   ? "no scene camera: its size does not match the scene target"
+                   : "no scene camera: unexpected projection",
+               values[0x120 / sizeof(f32)], values[0x124 / sizeof(f32)]);
         return;
     }
     oot_camera_sample_frame = render_trace_frame;
@@ -3760,10 +3778,10 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
         return false;
     }
     // Logs why the game's own upscale draws, when the reason changes and every 120th repeat.
-    const auto fail = [this](const char* reason) {
+    const auto fail = [this](const char* reason, std::string_view detail = {}) {
         if (reason != oot_fallback_reason || ++oot_fallback_repeats % 120 == 0) {
-            LOG_INFO(Render_Vulkan, "Ocarina temporal: the game's upscale draws frame {} ({})",
-                     render_trace_frame, reason);
+            LOG_INFO(Render_Vulkan, "Ocarina temporal: the game's upscale draws frame {} ({}{})",
+                     render_trace_frame, reason, detail);
         }
         if (reason != oot_fallback_reason) {
             oot_fallback_reason = reason;
@@ -3772,7 +3790,13 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
         return false;
     };
     if (oot_camera_sample_frame != render_trace_frame) {
-        return fail("no scene camera this frame");
+        if (!oot_camera_refusal || oot_camera_refusal->frame != render_trace_frame) {
+            return fail("no scene camera this frame");
+        }
+        const auto& refusal = *oot_camera_refusal;
+        return fail(refusal.reason, fmt::format(": camera {}x{}, scene target {}x{}",
+                                                refusal.camera_width, refusal.camera_height,
+                                                refusal.target_width, refusal.target_height));
     }
     if (oot_motion.depth_frame != render_trace_frame) {
         return fail("no scene depth this frame");
@@ -3810,21 +3834,26 @@ bool RasterizerVulkan::TryOcarinaUpscale(const ComputePipeline& pipeline, u64 na
     const auto extent = oot_motion.extent;
     using enum VideoCommon::OcarinaUpscalePass;
     const auto pass = VideoCommon::FindOcarinaUpscalePass(native_key, pipeline.ShaderHash());
-    const bool native_size = pass == FullSize;
+    const bool target_1440p = target.size.width == 2560 && target.size.height == 1440;
     // At the DLSS Performance render scale (1920x1080) the game upscales to 2560x1440 with its
     // 3/4 pass instead (QuincyForbes' f7d0938b5b). The scale is the one the game started with,
     // whatever quality is chosen since.
-    const bool three_quarter_1440p = pass == ThreeQuarter &&
-                                     oot_performance_scale && target.size.width == 2560 &&
-                                     target.size.height == 1440;
-    const bool pass_1440p = pass == Pass1440p || three_quarter_1440p;
+    const bool pass_1440p = target_1440p && (pass == OneToOne || pass == Scaled ||
+                                             (pass == ThreeQuarter && oot_performance_scale));
+    // Handheld with the Max Resolution add-on: FSR runs as native AA. DLAA through it is untested.
+    const bool native_size = pass == OneToOne && !target_1440p;
+    if (native_size && oot_backend != VideoCommon::OcarinaUpscaleBackend::Fsr) {
+        return fail("the full-size pass is replaced only by FSR");
+    }
     const bool upscale_4k = pass_1440p && !native_resolution;
-    // The 1440p pass takes any 16:9 scene up to 2560x1440: the DLSS render scales shrink it.
+    // The 1440p and scaled passes take any 16:9 scene up to their target: the DLSS render scales
+    // shrink it docked, and the game's dynamic resolution handheld (854x480 at its floor).
+    const bool scaled_scene = extent.width <= target.size.width &&
+                              extent.height <= target.size.height &&
+                              std::abs(static_cast<int>(extent.width * 9) -
+                                       static_cast<int>(extent.height * 16)) <= 32;
     const bool valid_extents =
-        pass_1440p ? extent.width <= 2560 && extent.height <= 1440 &&
-                         std::abs(static_cast<int>(extent.width * 9) -
-                                  static_cast<int>(extent.height * 16)) <= 32 &&
-                         target.size.width == 2560 && target.size.height == 1440
+        pass_1440p || pass == Scaled ? scaled_scene
         : native_size ? target.size.width == extent.width && target.size.height == extent.height
                       : target.size.width == extent.width * 4 / 3 &&
                             target.size.height == extent.height * 4 / 3;
@@ -4317,13 +4346,20 @@ bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
 }
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
-    std::scoped_lock lock{buffer_cache.mutex};
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     buffer_cache.Nx2CollectListCopies(true);
-    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount);
+    boost::container::small_vector<std::pair<DAddr, size_t>, 4> gpu_written;
+    const bool copied = buffer_cache.DMACopy(src_address, dest_address, amount, &gpu_written);
     if (buffer_cache.Nx2CopyListPages(scheduler.CurrentTick())) {
         scheduler.Flush();
     }
     buffer_cache.Nx2CollectListCopies(false);
+    // DMACopy copies guest memory without telling the texture cache. Images over the destination
+    // (pitch linear data textures such as Kirby Air Riders' vertex lighting) would keep their old
+    // contents, and stale pages would skip the upload of images made there later.
+    if (copied) {
+        texture_cache.WriteDmaCopy(src_address, dest_address, amount, gpu_written);
+    }
     return copied;
 }
 
@@ -4626,9 +4662,14 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
 }
 
 void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
-    if (!state_tracker.TouchDepthBias()) {
+    // The slope term is per pixel, so a rescaled viewport needs it scaled back to guest pixels.
+    const float slope_scale = texture_cache.IsRescaling() && regs.viewport_scale_offset_enabled
+                                  ? Settings::values.resolution_info.up_factor
+                                  : 1.0f;
+    if (!state_tracker.TouchDepthBias() && slope_scale == depth_bias_slope_scale) {
         return;
     }
+    depth_bias_slope_scale = slope_scale;
     float units = regs.depth_bias / 2.0f;
     const bool is_d24 = regs.zeta.format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
                         regs.zeta.format == Tegra::DepthFormat::X8Z24_UNORM ||
@@ -4652,7 +4693,7 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
         }
     }
     float clamp = regs.depth_bias_clamp;
-    float factor = regs.slope_scale_depth_bias;
+    float factor = regs.slope_scale_depth_bias * slope_scale;
     if (far_plane_draw) {
         const bool reversed =
             regs.viewport_scale_offset_enabled && regs.viewport_transform[0].scale_z < 0.0f;

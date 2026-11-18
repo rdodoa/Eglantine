@@ -325,6 +325,14 @@ private:
 
     u32 draw_counter = 0;
     std::optional<u64> oot_camera_sample_frame;
+    /// Why this frame's largest scene-target draw with a camera buffer gave no camera.
+    struct OcarinaCameraRefusal {
+        u64 frame{};
+        const char* reason{};
+        f32 camera_width{}, camera_height{};
+        u32 target_width{}, target_height{};
+    };
+    std::optional<OcarinaCameraRefusal> oot_camera_refusal;
     mutable std::optional<VideoCommon::OcarinaUpscaleBackend> oot_backend;
     /// The game started at the DLSS Performance render scale (1920x1080).
     bool oot_performance_scale{};
@@ -550,6 +558,7 @@ private:
     /// for it: it gets a depth bias towards the far value and depth clamping (see
     /// UpdateDynamicStates).
     bool far_plane_draw{};
+    float depth_bias_slope_scale = 1.0f;
     VertexInputState recorded_vertex_input;
     bool vertex_input_recorded{};
 

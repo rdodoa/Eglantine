@@ -118,6 +118,8 @@ void ConfigurePerGameAddons::ApplyConfiguration() {
         }
     }
 
+    disabled_addons = FileSys::StoredDisabledAddons(title_id, std::move(disabled_addons));
+
     std::sort(disabled_addons.begin(), disabled_addons.end());
     Settings::values.disabled_addons[title_id] = disabled_addons;
 }
@@ -329,7 +331,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
         }
 
         bool patch_disabled = false;
-        if (is_external_update) {
+        if (patch.off_by_default) {
+            patch_disabled = !patch.enabled;
+        } else if (is_external_update) {
             std::string disabled_key = fmt::format("Update@{}", patch.numeric_version);
             patch_disabled =
                 std::find(disabled.begin(), disabled.end(), disabled_key) != disabled.end();

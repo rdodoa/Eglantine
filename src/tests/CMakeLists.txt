@@ -19,11 +19,14 @@ add_executable(tests
     video_core/back_idle_trace.cpp
     video_core/list_macro_trace.cpp
     video_core/host_mip_limits.cpp
+    video_core/writeback_ranges.cpp
+    video_core/writeback_switches.cpp
     video_core/gpu_timestamp.cpp
     video_core/parallel_record.cpp
     video_core/parallel_record_vulkan.cpp
     video_core/semaphore_waiters.cpp
     video_core/hdr_output.cpp
+    video_core/host_vsync.cpp
     core/mii_model.cpp
     core/nx2_streamplay.cpp
     core/nx2_gpu_only_regions.cpp
@@ -420,7 +423,8 @@ add_test(NAME shader_translation_tests COMMAND shader_translation_tests)
 
 if (NOT ANDROID)
     target_sources(tests PRIVATE input_common/joycon_subcommand_response.cpp
-                                 input_common/rumble_mapping.cpp)
+                                 input_common/rumble_mapping.cpp
+                                 input_common/switch2_protocol.cpp)
     target_link_libraries(tests PRIVATE SDL3::SDL3)
 
     add_executable(config_tests

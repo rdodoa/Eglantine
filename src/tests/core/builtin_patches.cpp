@@ -420,7 +420,11 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     REQUIRE(listed(DynamicFps).enabled);
     REQUIRE(listed(DynamicFps).version ==
             fmt::format("IPS, replaced by {} when it applies", FpsUnlock));
-    auto patched = manager.PatchNSO(nso, "main");
+    // FPS Unlock lowers the step above 60 fps, so the display may start its frames
+    // (KProcess::IsFrameRateUnlocked).
+    bool frame_rate_unlocked = false;
+    auto patched = manager.PatchNSO(nso, "main", &frame_rate_unlocked);
+    REQUIRE(frame_rate_unlocked);
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(routine(patched, UnlockRoutineSize) ==
             std::string{RoutineHead} + "E300001C4268231EC300001C4278231E4840201EC0035FD6"
@@ -469,7 +473,11 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock}};
     REQUIRE_FALSE(listed(FpsUnlock).enabled);
     REQUIRE(listed(DynamicFps).version == "IPS");
-    patched = manager.PatchNSO(nso, "main");
+    // Dark's step never drops below 1.0, so the game keeps the vsync timer's rate
+    // (KProcess::IsFrameRateUnlocked stays false).
+    frame_rate_unlocked = false;
+    patched = manager.PatchNSO(nso, "main", &frame_rate_unlocked);
+    REQUIRE_FALSE(frame_rate_unlocked);
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicCallInstruction);
     REQUIRE(routine(patched, DynamicRoutineSize) ==
             std::string{RoutineHead} + "C300001C0309231E4020231E4D0000544840201EC0035FD6"
@@ -499,7 +507,9 @@ TEST_CASE("Built-in FPS Unlock defaults on and replaces Dynamic FPS", "[patch_ma
     // Both unchecked: hook and code cave stay untouched.
     Settings::values.disabled_addons[OcarinaTitleId] = {std::string{FpsUnlock},
                                                         std::string{DynamicFps}};
-    patched = manager.PatchNSO(nso, "main");
+    frame_rate_unlocked = false;
+    patched = manager.PatchNSO(nso, "main", &frame_rate_unlocked);
+    REQUIRE_FALSE(frame_rate_unlocked);
     REQUIRE(WordAt(patched, DynamicCallOffset) == DynamicOriginalInstruction);
     REQUIRE(WordAt(patched, DynamicRoutineOffset) == 0);
     REQUIRE(water_untouched(patched));
@@ -1024,6 +1034,89 @@ TEST_CASE("Built-in DLSS render scale follows the NVIDIA DLSS quality", "[patch_
 
     for (const auto& patch : context.Manager().GetPatches()) {
         CHECK(patch.name.find("render scale") == std::string::npos);
+    }
+}
+
+TEST_CASE("Built-in text speed is off until checked in Add-Ons", "[patch_manager]") {
+    constexpr size_t SiteOffset = sizeof(Loader::NSOHeader) + 0xAFE1B4;
+    constexpr size_t CaveOffset = sizeof(Loader::NSOHeader) + 0x3C46F00;
+    constexpr u32 LdrhInstruction = 0x7940DE69;
+    constexpr u32 BranchToCave = 0x14C52353;
+    constexpr std::string_view Double = "Text Speed 2x (built-in)";
+    constexpr std::string_view Quadruple = "Text Speed 4x (built-in)";
+    constexpr std::string_view Instant = "Text Speed Instant (built-in)";
+    PatchManagerTestContext context;
+    const auto manager = context.Manager();
+    auto nso = MakeDynamicMain();
+    std::memcpy(nso.data() + SiteOffset, &LdrhInstruction, sizeof(LdrhInstruction));
+
+    SECTION("Unchecked by default: listed off and not applied") {
+        for (const auto& patch : manager.GetPatches()) {
+            if (patch.name.starts_with("Text Speed")) {
+                REQUIRE_FALSE(patch.enabled);
+                REQUIRE(patch.off_by_default);
+            }
+        }
+        const auto patched = manager.PatchNSO(nso, "main");
+        REQUIRE(WordAt(patched, SiteOffset) == LdrhInstruction);
+        REQUIRE(WordAt(patched, CaveOffset) == 0);
+    }
+
+    SECTION("Each speed branches to the cave with its scale once checked") {
+        const std::array<std::pair<std::string_view, u32>, 3> speeds{{
+            {Double, 0x40000000},    // 2.0f
+            {Quadruple, 0x40800000}, // 4.0f
+            {Instant, 0x49742400},   // 1e6f
+        }};
+        for (const auto& [name, scale] : speeds) {
+            Settings::values.disabled_addons[OcarinaTitleId] = {FileSys::EnabledAddonKey(name)};
+            const auto patches = manager.GetPatches();
+            REQUIRE(std::ranges::any_of(patches, [&](const FileSys::Patch& patch) {
+                return patch.name == name && patch.enabled;
+            }));
+            const auto patched = manager.PatchNSO(nso, "main");
+            REQUIRE(WordAt(patched, SiteOffset) == BranchToCave);
+            REQUIRE(Common::HexToString(std::span{patched}.subspan(CaveOffset, 16)) ==
+                    "9000001C0008301E69DE4079ABDC3A17");
+            REQUIRE(WordAt(patched, CaveOffset + 16) == scale);
+        }
+    }
+
+    SECTION("With more than one checked, the fastest applies") {
+        Settings::values.disabled_addons[OcarinaTitleId] = {FileSys::EnabledAddonKey(Double),
+                                                            FileSys::EnabledAddonKey(Quadruple)};
+        const auto patched = manager.PatchNSO(nso, "main");
+        REQUIRE(WordAt(patched, CaveOffset + 16) == 0x40800000);
+    }
+
+    SECTION("Another word at the site skips") {
+        Settings::values.disabled_addons[OcarinaTitleId] = {FileSys::EnabledAddonKey(Double)};
+        std::memcpy(nso.data() + SiteOffset, &NopInstruction, sizeof(NopInstruction));
+        const auto patched = manager.PatchNSO(nso, "main");
+        REQUIRE(WordAt(patched, SiteOffset) == NopInstruction);
+        REQUIRE(WordAt(patched, CaveOffset) == 0);
+    }
+}
+
+TEST_CASE("Unchecked add-on lists store off-by-default built-ins when checked", "[patch_manager]") {
+    const std::string Double{"Text Speed 2x (built-in)"};
+    const std::string Quadruple{"Text Speed 4x (built-in)"};
+    const std::string Instant{"Text Speed Instant (built-in)"};
+    const std::string MaxResolutionName{MaxResolution};
+
+    SECTION("Unchecked off-by-default built-ins are not stored, checked ones get their key") {
+        auto stored = FileSys::StoredDisabledAddons(OcarinaTitleId,
+                                                    {MaxResolutionName, Double, Instant});
+        std::ranges::sort(stored);
+        std::vector<std::string> expected{MaxResolutionName,
+                                          FileSys::EnabledAddonKey(Quadruple)};
+        std::ranges::sort(expected);
+        REQUIRE(stored == expected);
+    }
+
+    SECTION("Other titles are stored as given") {
+        REQUIRE(FileSys::StoredDisabledAddons(OtherTitleId, {Double}) ==
+                std::vector<std::string>{Double});
     }
 }
 

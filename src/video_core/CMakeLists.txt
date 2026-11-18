@@ -124,6 +124,8 @@ add_library(video_core STATIC
     gpu_trace/trace_file.cpp
     gpu_trace/trace_file.h
     guest_memory.h
+    host_vsync.cpp
+    host_vsync.h
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
@@ -393,6 +395,8 @@ add_library(video_core STATIC
     texture_cache/types.h
     texture_cache/util.cpp
     texture_cache/util.h
+    texture_cache/writeback_ranges.h
+    texture_cache/writeback_switches.h
     textures/astc.h
     textures/astc.cpp
     textures/bcn.cpp

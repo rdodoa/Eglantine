@@ -454,11 +454,12 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
     for (const auto& desc : info.image_descriptors) {
         bool is_rescaled{};
         for (u32 index = 0; index < desc.count; ++index) {
-            ImageView& image_view{texture_cache.GetImageView((views++)->id)};
+            const VideoCommon::ImageViewId image_view_id{(views++)->id};
+            ImageView& image_view{texture_cache.GetImageView(image_view_id)};
             const VkImageView vk_image_view{
                 image_view.StorageView(desc.type, desc.format, desc.is_byte_addressed)};
             if (desc.is_written) {
-                texture_cache.MarkModification(image_view.image_id);
+                texture_cache.MarkStorageWrite(image_view_id);
             }
             guest_descriptor_queue.AddImage(vk_image_view);
             const bool element_rescaled{texture_cache.IsRescaling(image_view)};
