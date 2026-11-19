@@ -299,6 +299,11 @@ public:
     bool IsSwitch2() const {
         return m_is_switch2;
     }
+#ifdef HAS_NCE
+    bool UsesNativeExecution() const {
+        return m_page_table.GetBasePageTable().UsesNativeExecution();
+    }
+#endif
 
     bool IsDefaultApplicationSystemResource() const {
         return m_is_default_application_system_resource;

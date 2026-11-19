@@ -6,6 +6,9 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
+#ifdef HAS_NCE
+#include "core/device_memory.h"
+#endif
 #include "core/hle/kernel/k_address_space_info.h"
 #include "core/hle/kernel/k_page_table_base.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
@@ -205,6 +208,22 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     const size_t as_width = GetAddressSpaceWidth(as_type);
     const KProcessAddress start = 0;
     const KProcessAddress end = (1ULL << as_width);
+    KProcessAddress placement_end = end;
+#ifdef HAS_NCE
+    m_uses_native_execution = aslr_space_start != 0;
+    if (m_uses_native_execution) {
+        const auto& buffer = m_system.DeviceMemory().buffer;
+        const auto base = GetInteger(aslr_space_start);
+        R_UNLESS(as_width == 39 && buffer.IsDirectMapped() &&
+                     base == reinterpret_cast<u64>(buffer.VirtualBasePointer()) &&
+                     base < GetInteger(end) && buffer.VirtualSize() <= GetInteger(end) - base,
+                 ResultInvalidMemoryRegion);
+        placement_end = aslr_space_start + buffer.VirtualSize();
+        R_UNLESS(code_address >= aslr_space_start && code_address < placement_end &&
+                     code_size <= GetInteger(placement_end) - GetInteger(code_address),
+                 ResultInvalidMemoryRegion);
+    }
+#endif
 
     // Validate the region.
     ASSERT(start <= code_address);
@@ -244,6 +263,11 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
         m_code_region_start = m_address_space_start + aslr_space_start +
                               GetSpaceStart(KAddressSpaceInfo::Type::Map39Bit);
         m_code_region_end = m_code_region_start + GetSpaceSize(KAddressSpaceInfo::Type::Map39Bit);
+#ifdef HAS_NCE
+        if (m_uses_native_execution) {
+            m_code_region_end = placement_end;
+        }
+#endif
         m_alias_code_region_start = m_code_region_start;
         m_alias_code_region_end = m_code_region_end;
         process_code_start = Common::AlignDown(GetInteger(code_address), RegionAlignment);
@@ -278,13 +302,19 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     // Determine the region we can place our undetermineds in.
     KProcessAddress alloc_start;
     size_t alloc_size;
+#ifdef HAS_NCE
+    if (m_uses_native_execution) {
+        R_UNLESS(process_code_start >= m_code_region_start && process_code_end <= placement_end,
+                 ResultInvalidMemoryRegion);
+    }
+#endif
     if ((GetInteger(process_code_start) - GetInteger(m_code_region_start)) >=
-        (GetInteger(end) - GetInteger(process_code_end))) {
+        (GetInteger(placement_end) - GetInteger(process_code_end))) {
         alloc_start = m_code_region_start;
         alloc_size = GetInteger(process_code_start) - GetInteger(m_code_region_start);
     } else {
         alloc_start = process_code_end;
-        alloc_size = GetInteger(end) - GetInteger(process_code_end);
+        alloc_size = GetInteger(placement_end) - GetInteger(process_code_end);
     }
 
     // FW 18+: Apply extra region size calculations for already available region size
@@ -5752,6 +5782,9 @@ Result KPageTableBase::Operate(PageLinkedList* page_list, KProcessAddress virt_a
     case OperationType::Map: {
         ASSERT(virt_addr != 0);
         ASSERT(Common::IsAligned(GetInteger(virt_addr), PageSize));
+#ifdef HAS_NCE
+        R_UNLESS(this->ContainsNativeMapping(virt_addr, num_pages), ResultInvalidMemoryRegion);
+#endif
         m_memory->MapMemoryRegion(m_impl, virt_addr, num_pages * PageSize, phys_addr,
                                   ConvertToMemoryPermission(properties.perm), false);
 
@@ -5795,6 +5828,9 @@ Result KPageTableBase::Operate(PageLinkedList* page_list, KProcessAddress virt_a
     case OperationType::MapFirstGroup:
     case OperationType::MapFirstGroupPhysical: {
         const bool separate_heap = operation == OperationType::MapFirstGroupPhysical;
+#ifdef HAS_NCE
+        R_UNLESS(this->ContainsNativeMapping(virt_addr, num_pages), ResultInvalidMemoryRegion);
+#endif
 
         // We want to maintain a new reference to every page in the group.
         KScopedPageGroup spg(m_system.Kernel(), page_group, operation == OperationType::MapGroup);

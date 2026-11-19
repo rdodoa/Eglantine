@@ -258,11 +258,7 @@ struct Values {
 
     // Cpu
     SwitchableSetting<CpuBackend, true> cpu_backend{linkage,
-#ifdef HAS_NCE
-                                                    CpuBackend::Nce,
-#else
                                                     CpuBackend::Dynarmic,
-#endif
                                                     CpuBackend::Dynarmic,
 #ifdef HAS_NCE
                                                     CpuBackend::Nce,
@@ -1202,7 +1198,7 @@ bool IsGPUFenceBehaviorBalanced();
 bool IsGPUFenceBehaviorAccurate();
 
 bool IsFastmemEnabled();
-void SetNceEnabled(bool is_64bit);
+void SetNceEnabled(bool enabled);
 bool IsNceEnabled();
 
 void SetCurrentProgramID(u64 program_id);

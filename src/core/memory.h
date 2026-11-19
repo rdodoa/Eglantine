@@ -505,6 +505,10 @@ public:
     void SetGPUDirtyManagers(std::span<Core::GPUDirtyMemoryManager> managers);
 
     bool InvalidateNCE(Common::ProcessAddress vaddr, size_t size);
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+    std::optional<u64> RecoverNceAccess(u64 fault_address, bool write,
+                                        std::optional<u64> prior_trap);
+#endif
 
     bool InvalidateSeparateHeap(void* fault_address);
 

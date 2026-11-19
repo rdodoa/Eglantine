@@ -63,7 +63,12 @@ struct Memory::Impl {
     void SetCurrentPageTable(Kernel::KProcess& process) {
         current_page_table = &process.GetPageTable().GetImpl();
 
-        if (process.IsApplication() && Settings::IsFastmemEnabled()) {
+        bool use_fastmem = process.IsApplication() && Settings::IsFastmemEnabled();
+#ifdef HAS_NCE
+        use_fastmem = use_fastmem &&
+                      (!system.DeviceMemory().buffer.IsDirectMapped() || process.UsesNativeExecution());
+#endif
+        if (use_fastmem) {
             current_page_table->fastmem_arena = system.DeviceMemory().buffer.VirtualBasePointer();
         } else {
             current_page_table->fastmem_arena = nullptr;
@@ -75,6 +80,12 @@ struct Memory::Impl {
 #else
         host_buffer = std::addressof(system.DeviceMemory().buffer);
 #endif
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        if (process.UsesNativeExecution()) {
+            nce_pages = std::make_unique<Common::SparseLargeVector<u32>>(
+                u64{1} << (current_page_table->GetAddressSpaceBits() - LICHII_PAGEBITS));
+        }
+#endif
     }
 
     void MapMemoryRegion(Common::PageTable& page_table, Common::ProcessAddress base, u64 size,
@@ -84,6 +95,18 @@ struct Memory::Impl {
         ASSERT_MSG((base & LICHII_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
         ASSERT_MSG(target >= DramMemoryMap::Base, "Out of bounds target: {:016X}",
                    GetInteger(target));
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        std::unique_lock lock{nce_page_mutex, std::defer_lock};
+        if (nce_pages) {
+            lock.lock();
+            const u64 first = GetInteger(base) >> LICHII_PAGEBITS;
+            const u64 count = size >> LICHII_PAGEBITS;
+            nce_pages->CommitRegion(first, first + count);
+            for (u64 page = first; page < first + count; ++page) {
+                nce_pages->GetUnchecked(page) = static_cast<u32>(perms);
+            }
+        }
+#endif
         MapPages(page_table, base / LICHII_PAGESIZE, size / LICHII_PAGESIZE, target,
                  Common::PageType::Memory);
 
@@ -96,6 +119,14 @@ struct Memory::Impl {
                      bool separate_heap) {
         ASSERT_MSG((size & LICHII_PAGEMASK) == 0, "non-page aligned size: {:016X}", size);
         ASSERT_MSG((base & LICHII_PAGEMASK) == 0, "non-page aligned base: {:016X}", GetInteger(base));
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        std::unique_lock lock{nce_page_mutex, std::defer_lock};
+        if (nce_pages) {
+            lock.lock();
+            const u64 first = GetInteger(base) >> LICHII_PAGEBITS;
+            nce_pages->ZeroRegion(first, first + (size >> LICHII_PAGEBITS));
+        }
+#endif
         MapPages(page_table, base / LICHII_PAGESIZE, size / LICHII_PAGESIZE, 0,
                  Common::PageType::Unmapped);
 
@@ -112,6 +143,16 @@ struct Memory::Impl {
         if (!current_page_table->fastmem_arena) {
             return;
         }
+
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        if (nce_pages) {
+            std::scoped_lock lock{nce_page_mutex};
+            UpdateNceProtection(vaddr, size, [&](u32 state) {
+                return (state & ~NceBaseMask) | static_cast<u32>(perms);
+            });
+            return;
+        }
+#endif
 
         u64 protect_bytes = 0, protect_begin = 0;
 
@@ -499,6 +540,25 @@ struct Memory::Impl {
             return;
         }
 
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        std::unique_lock lock{nce_page_mutex, std::defer_lock};
+        if (nce_pages) {
+            lock.lock();
+            const u64 begin = vaddr & ~LICHII_PAGEMASK;
+            const u64 end = Common::AlignUp(vaddr + size, LICHII_PAGESIZE);
+            UpdateNceProtection(begin, end - begin, [&](u32 state) {
+                if (!cached) {
+                    return (state & NceCached) != 0
+                               ? (state & ~(NceCached | NceReadReady)) + NceCacheGeneration
+                               : state;
+                }
+                if ((state & NceCached) == 0) {
+                    return (state | NceCached) + NceCacheGeneration;
+                }
+                return state;
+            });
+        } else
+#endif
         if (current_page_table->fastmem_arena) {
             Common::MemoryPermission perm{};
             // EDEN_NX2_NO_REACTIVE=1 drops the read traps on Switch 2 programs. Opt-in: without
@@ -591,12 +651,31 @@ struct Memory::Impl {
         }();
         return !disabled && current_page_table->fastmem_arena &&
                !Settings::ReactiveFlushing() &&
+#ifdef HAS_NCE
+               !Settings::IsNceEnabled();
+#else
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
+#endif
     }
 
     void RasterizerArmReadTraps(u64 vaddr, u64 size) {
         // Clean cached read areas also need invalidation when reactive flushing is enabled.
         read_trap_generation.fetch_add(1, std::memory_order_release);
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+        if (nce_pages && vaddr != 0 && size != 0 &&
+            AddressSpaceContains(*current_page_table, vaddr, size)) {
+            std::scoped_lock lock{nce_page_mutex};
+            const u64 begin = vaddr & ~LICHII_PAGEMASK;
+            const u64 end = Common::AlignUp(vaddr + size, LICHII_PAGESIZE);
+            UpdateNceProtection(begin, end - begin, [](u32 state) {
+                if ((state & NceCached) == 0) {
+                    return state;
+                }
+                return (state & ~NceReadReady) + NceCacheGeneration;
+            });
+            return;
+        }
+#endif
         if (vaddr == 0 || size == 0 || !AddressSpaceContains(*current_page_table, vaddr, size) ||
             !ReadTrapsEnabled()) {
             return;
@@ -1008,6 +1087,111 @@ struct Memory::Impl {
             p, scratch_buffers[core], [&](DAddr address) { gpu.InvalidateRegion(address, size, true); });
     }
 
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+    static constexpr u32 NceBaseMask = 0x7;
+    static constexpr u32 NceCached = 1u << 3;
+    static constexpr u32 NceReadReady = 1u << 4;
+    static constexpr u32 NceCacheGeneration = 1u << 5;
+
+    static Common::MemoryPermission NceHostPermission(u32 state) {
+        const auto base = static_cast<Common::MemoryPermission>(state & NceBaseMask);
+        if ((state & NceCached) == 0) {
+            return base;
+        }
+        auto mask = Common::MemoryPermission::Execute;
+        if ((state & NceReadReady) != 0) {
+            mask |= Common::MemoryPermission::Read;
+        }
+        return base & mask;
+    }
+
+    template <typename Update>
+    void UpdateNceProtection(u64 address, u64 size, Update update) {
+        const u64 first = address >> LICHII_PAGEBITS;
+        const u64 end = first + (size >> LICHII_PAGEBITS);
+        u64 run_start = first;
+        auto run_permission = Common::MemoryPermission{};
+        const auto finish_run = [&](u64 page) {
+            if (page > run_start) {
+                host_buffer->Protect(run_start << LICHII_PAGEBITS,
+                                     (page - run_start) << LICHII_PAGEBITS, run_permission);
+            }
+            run_start = page;
+        };
+        nce_pages->CommitRegion(first, end);
+        for (u64 page = first; page < end; ++page) {
+            auto& state = nce_pages->GetUnchecked(page);
+            const u32 previous = state;
+            state = update(state);
+            const auto permission = NceHostPermission(state);
+            if (permission == NceHostPermission(previous)) {
+                finish_run(page);
+                run_start = page + 1;
+            } else if (permission != run_permission) {
+                finish_run(page);
+                run_permission = permission;
+            }
+        }
+        finish_run(end);
+    }
+
+    std::optional<u64> RecoverNceAccess(u64 fault_address, bool write,
+                                        std::optional<u64> prior_trap) {
+        const u64 address = fault_address & ~LICHII_PAGEMASK;
+        const u64 page = address >> LICHII_PAGEBITS;
+        const auto access = write ? Common::MemoryPermission::Write : Common::MemoryPermission::Read;
+        if (!nce_pages || page >= nce_pages->size()) {
+            return std::nullopt;
+        }
+        std::unique_lock lock{nce_page_mutex};
+        const auto state = (*nce_pages)[page];
+        const auto base = static_cast<Common::MemoryPermission>(state & NceBaseMask);
+        const auto [ptr, type, block] = current_page_table->entries[page].PointerTypeBlock(true);
+        const auto trap_key = [](u16 mapping, u32 page_state) {
+            return (static_cast<u64>(mapping) << 32) | (page_state / NceCacheGeneration);
+        };
+        if (ptr == 0 || !True(base & access) ||
+            (type != Common::PageType::Memory && type != Common::PageType::RasterizerCachedMemory)) {
+            return std::nullopt;
+        }
+        if (True(NceHostPermission(state) & access)) {
+            const u64 trap = trap_key(block, state);
+            return state >= NceCacheGeneration && prior_trap != trap ? std::optional{trap}
+                                                                    : std::nullopt;
+        }
+        if (type != Common::PageType::RasterizerCachedMemory) {
+            return std::nullopt;
+        }
+        lock.unlock();
+        if (write) {
+            InvalidateGPUMemory(reinterpret_cast<u8*>(ptr + address), LICHII_PAGESIZE);
+        } else {
+            DownloadFromRasterizer(address, LICHII_PAGESIZE);
+        }
+        lock.lock();
+        const auto [current_ptr, current_type, current_block] =
+            current_page_table->entries[page].PointerTypeBlock(true);
+        if (current_ptr != ptr || current_block != block) {
+            return std::nullopt;
+        }
+        const auto current = (*nce_pages)[page];
+        if (!write && current_type == Common::PageType::RasterizerCachedMemory &&
+            current / NceCacheGeneration == state / NceCacheGeneration) {
+            UpdateNceProtection(address, LICHII_PAGESIZE, [](u32 previous) {
+                return previous | NceReadReady;
+            });
+        }
+        const auto resolved = (*nce_pages)[page];
+        if (!True(NceHostPermission(resolved) & access)) {
+            return std::nullopt;
+        }
+        return trap_key(current_block, resolved);
+    }
+
+    std::unique_ptr<Common::SparseLargeVector<u32>> nce_pages;
+    std::mutex nce_page_mutex;
+#endif
+
     Core::System& system;
     Tegra::MaxwellDeviceMemoryManager* gpu_device_memory{};
     Common::PageTable* current_page_table = nullptr;
@@ -1249,6 +1433,13 @@ bool Memory::InvalidateNCE(Common::ProcessAddress vaddr, size_t size) {
 
     return mapped && ptr != nullptr;
 }
+
+#if defined(HAS_NCE) && !defined(__ANDROID__)
+std::optional<u64> Memory::RecoverNceAccess(u64 fault_address, bool write,
+                                           std::optional<u64> prior_trap) {
+    return impl->RecoverNceAccess(fault_address, write, prior_trap);
+}
+#endif
 
 bool Memory::InvalidateSeparateHeap(void* fault_address) {
 #ifdef __ANDROID__
