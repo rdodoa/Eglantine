@@ -348,20 +348,41 @@ target_compile_definitions(tests PRIVATE
 
 add_test(NAME tests COMMAND tests)
 
-if (HAS_NCE AND LINUX)
+if ((HAS_NCE AND LINUX) OR HAS_HYPERVISOR)
     enable_language(ASM)
     add_executable(arm_cpu_guest_tests core/arm_cpu_guest.cpp core/arm_cpu_guest.S)
-    target_link_libraries(arm_cpu_guest_tests PRIVATE core video_core frontend_common)
+    target_link_libraries(arm_cpu_guest_tests PRIVATE core video_core frontend_common
+        ${PLATFORM_LIBRARIES})
     target_compile_options(arm_cpu_guest_tests PRIVATE
         $<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-variable>)
-    add_test(NAME arm_cpu_guest_nce COMMAND arm_cpu_guest_tests nce)
-    add_test(NAME arm_cpu_guest_nce_nx2_clock COMMAND arm_cpu_guest_tests nce --nx2-clock)
+    if (HAS_HYPERVISOR)
+        set(native_backend hvf)
+        add_custom_command(TARGET arm_cpu_guest_tests POST_BUILD
+            COMMAND /usr/bin/codesign --force --sign -
+                --entitlements "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements"
+                "$<TARGET_FILE:arm_cpu_guest_tests>"
+            VERBATIM)
+        add_test(NAME arm_cpu_guest_hvf_execute_fault COMMAND arm_cpu_guest_tests hvf --execute-fault)
+        add_test(NAME arm_cpu_guest_hvf_revoke_fault COMMAND arm_cpu_guest_tests hvf --revoke-fault)
+        add_test(NAME arm_cpu_guest_hvf_relaunch COMMAND arm_cpu_guest_tests hvf --relaunch)
+        set_tests_properties(arm_cpu_guest_hvf_execute_fault arm_cpu_guest_hvf_revoke_fault
+            arm_cpu_guest_hvf_relaunch
+            PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
+    else()
+        set(native_backend nce)
+    endif()
+    add_test(NAME arm_cpu_guest_${native_backend} COMMAND arm_cpu_guest_tests ${native_backend})
+    add_test(NAME arm_cpu_guest_${native_backend}_nx2_clock
+        COMMAND arm_cpu_guest_tests ${native_backend} --nx2-clock)
     add_test(NAME arm_cpu_guest_dynarmic COMMAND arm_cpu_guest_tests dynarmic)
-    add_test(NAME arm_cpu_guest_nce_fault COMMAND arm_cpu_guest_tests nce --fault)
-    add_test(NAME arm_cpu_guest_nce_permission_fault COMMAND arm_cpu_guest_tests nce --permission-fault)
+    add_test(NAME arm_cpu_guest_${native_backend}_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --fault)
+    add_test(NAME arm_cpu_guest_${native_backend}_permission_fault
+        COMMAND arm_cpu_guest_tests ${native_backend} --permission-fault)
     set_tests_properties(
-        arm_cpu_guest_nce arm_cpu_guest_nce_nx2_clock arm_cpu_guest_dynarmic
-        arm_cpu_guest_nce_fault arm_cpu_guest_nce_permission_fault
+        arm_cpu_guest_${native_backend} arm_cpu_guest_${native_backend}_nx2_clock
+        arm_cpu_guest_dynarmic arm_cpu_guest_${native_backend}_fault
+        arm_cpu_guest_${native_backend}_permission_fault
         PROPERTIES LABELS arm_cpu_guest RESOURCE_LOCK arm_cpu_guest TIMEOUT 35)
 endif()
 

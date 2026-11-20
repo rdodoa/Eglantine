@@ -3,11 +3,18 @@
 
 #include "arm_cpu_guest_layout.h"
 
+#ifdef __APPLE__
+.section __TEXT,__const
+.p2align 4
+.globl _arm_cpu_guest_begin
+_arm_cpu_guest_begin:
+#else
 .section .rodata.arm_cpu_guest,"a",%progbits
 .p2align 4
 .global arm_cpu_guest_begin
 .type arm_cpu_guest_begin, %object
 arm_cpu_guest_begin:
+#endif
 .Limage:
     b .Lmain
     .long 0
@@ -46,6 +53,10 @@ arm_cpu_guest_begin:
     cmp w0, #ARM_GUEST_FAULT
     b.eq .Lfault
     cmp w0, #ARM_GUEST_PERMISSION_FAULT
+    b.eq .Lfault
+    cmp w0, #ARM_GUEST_EXECUTE_FAULT
+    b.eq .Lfault
+    cmp w0, #ARM_GUEST_REVOKE_FAULT
     b.eq .Lfault
     cmp w0, #ARM_GUEST_BENCHMARK
     b.eq .Lbenchmark
@@ -199,30 +210,67 @@ arm_cpu_guest_begin:
     adr x1, .Lfault_worker
     add x3, x19, #2, lsl #12
     mov w4, #43
-    mov w5, #0
+    cmp w2, #ARM_GUEST_REVOKE_FAULT
+    cset w5, eq
     svc #0x8
     cbnz w0, .Lexit
     str w1, [x19, #ARM_GUEST_HANDLE_A]
+    ldr w8, [x19, #ARM_GUEST_MODE]
+    cmp w8, #ARM_GUEST_REVOKE_FAULT
+    b.ne 1f
+    add x8, x19, #1, lsl #12
+    ldr x2, [x8]
+1:
     mov w0, w1
     svc #0x9
     cbnz w0, .Lexit
+    ldr w0, [x19, #ARM_GUEST_MODE]
+    cmp w0, #ARM_GUEST_REVOKE_FAULT
+    b.ne .Lpass
+    add x1, x19, #ARM_GUEST_REVOKE_FINISHED
+1:
+    ldar w0, [x1]
+    cbz w0, 1b
     b .Lpass
 
 .Lfault_worker:
     adr x19, .Ldata
+    cmp w0, #ARM_GUEST_REVOKE_FAULT
+    b.eq .Lrevoke
     mov w1, #1
     str w1, [x19, #ARM_GUEST_FAULT_ENTERED]
     cmp w0, #ARM_GUEST_PERMISSION_FAULT
     b.eq 1f
+    cmp w0, #ARM_GUEST_EXECUTE_FAULT
+    b.eq 3f
     mov x0, #0
     ldr x2, [x0]
-    b 2f
+    b .Lfault_continued
 1:
     adr x0, .Lrodata
+    ldr x2, [x0]
+    str w1, [x19, #ARM_GUEST_RO_READ_DONE]
     str x2, [x0]
-2:
+.Lfault_continued:
     str w1, [x19, #ARM_GUEST_FAULT_CONTINUED]
     b .Lworker_exit
+3:
+    add x0, x19, #1, lsl #12
+    blr x0
+    b .Lfault_continued
+
+.Lrevoke:
+    add x0, x19, #1, lsl #12
+    ldr x2, [x0]
+    mov w1, #1
+    add x3, x19, #ARM_GUEST_FAULT_ENTERED
+    stlr w1, [x3]
+    add x3, x19, #ARM_GUEST_REVOKE_READY
+1:
+    ldar w4, [x3]
+    cbz w4, 1b
+    ldr x2, [x0]
+    b .Lfault_continued
 
 .Lbenchmark:
     stage ARM_GUEST_CHECK_BENCHMARK
@@ -270,6 +318,8 @@ arm_cpu_guest_begin:
     .org .Limage + ARM_GUEST_DATA_OFFSET
 .Ldata:
     .org .Limage + ARM_GUEST_IMAGE_SIZE
+#ifndef __APPLE__
 .size arm_cpu_guest_begin, . - arm_cpu_guest_begin
 
 .section .note.GNU-stack,"",%progbits
+#endif

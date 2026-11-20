@@ -578,6 +578,10 @@ public:
 
     void InitializeInterfaces(KernelCore& kernel);
 
+#ifdef HAS_HYPERVISOR
+    void ReleaseHypervisor();
+#endif
+
     Core::Memory::Memory& GetMemory() {
         return m_memory;
     }

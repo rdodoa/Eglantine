@@ -112,6 +112,12 @@ Result FlushDataCache(AddressType addr, u64 size) {
 }
 
 constexpr Common::MemoryPermission ConvertToMemoryPermission(KMemoryPermission perm) {
+#ifdef HAS_HYPERVISOR
+    if (True(perm & KMemoryPermission::NotMapped)) {
+        return {};
+    }
+    perm &= KMemoryPermission::UserMask;
+#endif
     Common::MemoryPermission perms{};
     if (True(perm & KMemoryPermission::UserRead)) {
         perms |= Common::MemoryPermission::Read;
@@ -119,7 +125,7 @@ constexpr Common::MemoryPermission ConvertToMemoryPermission(KMemoryPermission p
     if (True(perm & KMemoryPermission::UserWrite)) {
         perms |= Common::MemoryPermission::Write;
     }
-#ifdef HAS_NCE
+#if defined(HAS_NCE) || defined(HAS_HYPERVISOR)
     if (True(perm & KMemoryPermission::UserExecute)) {
         perms |= Common::MemoryPermission::Execute;
     }

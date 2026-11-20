@@ -148,6 +148,9 @@ struct KernelCore::Impl {
             // finalize can't unmap the next game's memory, and clear the arena.
             const u32 references = application_process->GetReferenceCount();
             application_process->GetPageTable().GetImpl().fastmem_arena = nullptr;
+#ifdef HAS_HYPERVISOR
+            application_process->ReleaseHypervisor();
+#endif
             application_process->Close(system.Kernel());
             application_process = nullptr;
             if (references > 1) {

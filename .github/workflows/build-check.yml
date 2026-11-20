@@ -241,6 +241,52 @@ jobs:
             .ccache
           key: gcc13-arm64-nce-${{ github.sha }}
 
+  macos-arm64-hypervisor:
+    name: Apple Silicon Hypervisor build and signing
+    needs: changes
+    if: needs.changes.outputs.build == 'true' && startsWith(github.head_ref, 'capy/nce-macos')
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        env:
+          HOMEBREW_NO_INSTALL_CLEANUP: 1
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          test "$(uname -m)" = arm64
+          brew install autoconf automake boost cmake ffmpeg fmt glslang hidapi libtool \
+            libusb lz4 molten-vk ninja nlohmann-json openssl pkg-config sdl3 speexdsp \
+            spirv-tools vulkan-loader zlib zstd
+
+      - name: Configure headless build and tests
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DBUILD_TESTING=ON -DLICHII_TESTS=ON \
+            -DENABLE_QT=OFF -DLICHII_CMD=ON \
+            -DLICHII_ROOM=OFF -DLICHII_ROOM_STANDALONE=OFF \
+            "-DCMAKE_PREFIX_PATH=$(brew --prefix zlib)" \
+            "-DOPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" \
+            -DVulkanHeaders_FORCE_BUNDLED=ON -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
+
+      - name: Build and verify both executable signatures
+        run: |
+          cmake --build build --parallel 3 --target arm_cpu_guest_tests lichii-cmd
+          for binary in build/bin/arm_cpu_guest_tests build/bin/eden-cli; do
+            codesign --verify --strict "$binary"
+            codesign -d --entitlements - "$binary" | grep -F com.apple.security.hypervisor
+            if otool -L "$binary" | grep -F /usr/lib/libhvf.dylib; then
+              exit 1
+            fi
+          done
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^arm_cpu_guest_dynarmic$'
+
   windows-clang-cl:
     name: Windows clang-cl production build and tests
     needs: changes

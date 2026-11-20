@@ -32,6 +32,7 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/engines/fermi_2d.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/native_upscale.h"
@@ -2008,10 +2009,16 @@ void KeplerCompute::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: compute macros back on the engine");
 }
 
-void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument, bool from_macro) {
     // As ProcessNativeMethod does with the macro code and bindings.
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
+    }
+    if (VideoCommon::MmeCapture::active && method - 0x45 < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "compute macro" : "compute dma",
+            !native_context ? "standalone" : fs.compute_uploaded ? "compute" : "3d",
+            method, argument, FrontMacroEngine(fs).native_write_offset, fs.bind_pointer);
     }
     Nx2ListIndirect::NoteUploadMethod(fs.upload, method, argument, [&fs](u32 reg) {
         return fs.registers[reg];
@@ -2319,9 +2326,11 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
                                   FrontState& fs) {
     const auto positions = FrontMacroPositions(fs);
     const u32 method = *fs.executing_macro;
-    const u32 start = positions[((method - 0xe00) / 2) % positions.size()];
+    const u32 slot = static_cast<u32>(((method - 0xe00) / 2) % positions.size());
+    const u32 start = positions[slot];
     fs.executing_macro.reset();
     auto& macro = FrontMacroEngine(fs);
+    const bool use_compute_bank = fs.compute_uploaded;
     if (native_data_ram) {
         macro.native_interpreter.active_dram = native_data_ram;
     }
@@ -2344,7 +2353,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             return false;
         }
         ListTrace::NoteWrite(trace, address, value);
-        FrontApply(fs, address, value);
+        FrontApply(fs, address, value, true);
         if (IsQmdMethod(address)) {
             GetFrontQmd().MaybeTakeOver(split, native_qmd);
         }
@@ -2385,17 +2394,19 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             Nx2ListIndirect::Stats::NoteConcretized(reason);
         }
     }
+    u32 last_pc = ~0U;
 #ifdef ARCHITECTURE_x86_64
     if (!macro.native_jit) {
         macro.native_jit = std::make_shared<TuringMacroJit>();
     }
-    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation);
+    const bool capture_pc = VideoCommon::MmeCapture::active;
+    macro.native_jit->Prepare(macro.native_code, macro.native_code_generation, capture_pc);
     const auto result =
         trace != nullptr && trace->data_ram
             ? macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit)
             : macro.native_jit->Execute(start, fs.parameters,
                                         std::span<u32>{*macro.native_interpreter.active_dram},
-                                        read, emit);
+                                        read, emit, capture_pc ? &last_pc : nullptr);
 #else
     const auto result =
         macro.native_interpreter.Execute(macro.native_code, start, fs.parameters, read, emit);
@@ -2404,6 +2415,12 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
         macro.native_execution_failed = true;
         LOG_ERROR(HW_GPU, "Native MME (split front) failed: compute start={:#x}, consumed={}, error={}",
                   start, result.consumed, result.error);
+        if (VideoCommon::MmeCapture::active) {
+            VideoCommon::MmeCapture::Fail(
+                memory_manager.GetID(), this,
+                !native_context ? "standalone" : use_compute_bank ? "compute" : "3d",
+                method, slot, start, result, last_pc, macro.native_code, fs.parameters);
+        }
     }
     if (trace != nullptr) {
         ListTrace::EndCall(*trace, false, macro.native_interpreter.data_ram_reads,

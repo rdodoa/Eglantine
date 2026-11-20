@@ -33,6 +33,7 @@
 #include "video_core/nx2_list_indirect.h"
 #include "video_core/nx2_list_indirect_stats.h"
 #include "video_core/nx2_list_macro_trace.h"
+#include "video_core/nx2_mme_capture.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
@@ -1668,6 +1669,15 @@ void Maxwell3D::ReleaseFront() {
     LOG_INFO(HW_GPU, "GPU thread split stopped: 3D macros back on the engine");
 }
 
+void Maxwell3D::FrontCaptureMmeWrite(const FrontState& fs, u32 method, u32 value, bool from_macro) {
+    if (method - MAXWELL3D_REG_INDEX(load_mme.instruction_ptr) < 4) {
+        VideoCommon::MmeCapture::RecordWrite(
+            memory_manager.GetID(), this, from_macro ? "3d macro" : "3d dma", "3d", method, value,
+            GetNativeMacroEngine().native_write_offset,
+            fs.regs[MAXWELL3D_REG_INDEX(load_mme.start_address_ptr)]);
+    }
+}
+
 void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                            u32 argument, bool is_last_call, bool from_macro) {
     namespace Profile = VideoCommon::Nx2Profile;
@@ -1695,6 +1705,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
         return;
+    }
+    if (VideoCommon::MmeCapture::active) {
+        FrontCaptureMmeWrite(fs, method, value, from_macro);
     }
     if (!execution_mask[method]) {
         // Nothing would change on the back: CallMethod and ConsumeSinkImpl skip same-value state
@@ -1868,6 +1881,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 fs.shadow[method] = argument;
             } else if (fs.control == Regs::ShadowRamControl::Replay) {
                 value = fs.shadow[method];
+            }
+            if (VideoCommon::MmeCapture::active) {
+                FrontCaptureMmeWrite(fs, method, value, false);
             }
             fs.regs[method] = value;
             FrontTrackInstanceLoop(fs, method, value); // DrawBegin runs for every word

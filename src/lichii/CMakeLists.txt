@@ -266,12 +266,19 @@ add_executable(lichii
 
 set_target_properties(lichii PROPERTIES OUTPUT_NAME "lichii")
 
-# Shipped next to the executable: the NX2 switches a GUI launch cannot set another way. Read at
-# startup (LoadNx2Switches in main.cpp); a user copy in %APPDATA%\lichii overrides it.
-add_custom_command(TARGET lichii POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
-    VERBATIM)
+set(_nx2_switches "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt")
+if (APPLE)
+    set_source_files_properties("${_nx2_switches}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(lichii PRIVATE "${_nx2_switches}")
+    add_custom_command(TARGET lichii POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
+        VERBATIM)
+else()
+    add_custom_command(TARGET lichii POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_nx2_switches}" "$<TARGET_FILE_DIR:lichii>/nx2_switches.txt"
+        VERBATIM)
+endif()
 
 if (LICHII_CRASH_DUMPS)
     target_sources(lichii PRIVATE
@@ -409,6 +416,18 @@ if (APPLE)
 
     set_target_properties(lichii PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(lichii PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)
+
+    if (HAS_HYPERVISOR)
+        set_target_properties(lichii PROPERTIES
+            XCODE_ATTRIBUTE_CODE_SIGN_ENTITLEMENTS "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements")
+        if (NOT CMAKE_GENERATOR MATCHES "Xcode")
+            add_custom_command(TARGET lichii POST_BUILD
+                COMMAND /usr/bin/codesign --force --sign -
+                    --entitlements "${PROJECT_SOURCE_DIR}/dist/eglantine.entitlements"
+                    "$<TARGET_BUNDLE_DIR:lichii>"
+                VERBATIM)
+        endif()
+    endif()
 
     set(CMAKE_FIND_LIBRARY_SUFFIXES ".dylib")
     find_library(MOLTENVK_LIBRARY MoltenVK REQUIRED)

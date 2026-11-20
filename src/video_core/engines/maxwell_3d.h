@@ -3509,6 +3509,7 @@ private:
     void ReleaseFront();
     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
                     bool is_last_call, bool from_macro);
+    void FrontCaptureMmeWrite(const FrontState& state, u32 method, u32 value, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     bool FrontRunOnBack(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state,
                         const MacroEngine& engine, u32 start);
