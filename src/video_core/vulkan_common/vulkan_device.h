@@ -21,6 +21,7 @@
 #include "common/settings.h"
 #include "video_core/fsr4_support.h"
 #include "video_core/vulkan_common/descriptor_limits.h"
+#include "video_core/vulkan_common/device_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #include <vulkan/vulkan_beta.h>
@@ -269,6 +270,10 @@ public:
     /// unhandled exception on whichever thread saw the loss (#1934).
     [[noreturn]] void ReportLoss() const;
 
+    /// Ends the process when submitted GPU work stopped making progress without the driver
+    /// reporting a loss (EDEN_NX2_GPU_WATCHDOG). Makes no Vulkan calls.
+    [[noreturn]] void ReportUnresponsive() const;
+
     /// Logs what VK_EXT_device_fault reports about a device loss.
     void ReportDeviceFault() const;
 
@@ -294,7 +299,11 @@ public:
         SparsePages,
         DeviceBuffers,
     };
-    static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+    static constexpr VkDeviceSize SeparatePoolBlockSize = DefaultSeparatePoolBlockSize;
+
+    VkDeviceSize GetDeviceBufferPoolBlockSize() const noexcept {
+        return device_buffer_pool_block_size;
+    }
 
     /// The pool of that kind for a memory type, created on first use (null if that failed).
     VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
@@ -1561,6 +1570,7 @@ private:
     size_t main_heap{};       ///< Largest device-local heap, where images live.
     u64 heap_size_limit{};    ///< EDEN_NX2_VRAM_LIMIT_MIB for device-local heaps, 0 if unset.
     u64 main_heap_size{};     ///< Size of main_heap, with heap_size_limit applied.
+    VkDeviceSize device_buffer_pool_block_size{SeparatePoolBlockSize};
 
     /// Format properties dictionary.
     ::Common::unordered_map<VkFormat, VkFormatProperties> format_properties;

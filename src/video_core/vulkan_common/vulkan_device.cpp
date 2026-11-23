@@ -1096,7 +1096,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
-            .blockSize = SeparatePoolBlockSize,
+            .blockSize = kind == SeparatePool::DeviceBuffers ? device_buffer_pool_block_size
+                                                             : SeparatePoolBlockSize,
             .minBlockCount = 0,
             .maxBlockCount = 0,
             .priority = 0.f,
@@ -1242,14 +1243,31 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
-void Device::ReportLoss() const {
+namespace {
+// The first thread to report a lost or unresponsive device ends the process; the others park.
+void ClaimDeviceReport() {
     static std::atomic_flag reported;
     if (reported.test_and_set()) {
-        // The first thread to see the loss reports it and ends the process.
         for (;;) {
             std::this_thread::sleep_for(std::chrono::hours{1});
         }
     }
+}
+} // Anonymous namespace
+
+void Device::ReportUnresponsive() const {
+    ClaimDeviceReport();
+    LOG_CRITICAL(Render_Vulkan,
+                 "Closing Lichii: the GPU stopped making progress (EDEN_NX2_GPU_WATCHDOG)");
+    Common::Log::Flush();
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+#endif
+    std::_Exit(EXIT_FAILURE);
+}
+
+void Device::ReportLoss() const {
+    ClaimDeviceReport();
     LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
     ReportDeviceFault();
     if (nsight_aftermath_tracker) {
@@ -2546,6 +2564,17 @@ void Device::CollectPhysicalMemoryInfo() {
         device_access_memory += heap_size;
     }
     main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
+    if ((mem_properties.memoryHeaps[main_heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
+        const u64 main_heap_budget = limit(budget.heapBudget[main_heap]);
+        device_buffer_pool_block_size = SelectDeviceBufferPoolBlockSize(
+            properties.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+            main_heap_size, main_heap_budget);
+        if (device_buffer_pool_block_size != SeparatePoolBlockSize) {
+            LOG_INFO(Render_Vulkan, "Device buffer pool: {} MiB blocks (heap {} MiB, budget {} MiB)",
+                     device_buffer_pool_block_size >> 20, main_heap_size >> 20,
+                     main_heap_budget >> 20);
+        }
+    }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;

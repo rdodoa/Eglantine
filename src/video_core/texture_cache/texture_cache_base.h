@@ -51,6 +51,7 @@
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
 #include "video_core/texture_cache/types.h"
+#include "video_core/texture_cache/util.h"
 #include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
 #include "video_core/textures/unswizzle_worker.h"
@@ -72,6 +73,15 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+};
+
+/// A compute dispatch's texture and sampler pools, as its engine held them.
+struct ComputePools {
+    GPUVAddr tic{};
+    u32 tic_limit{};
+    GPUVAddr tsc{};
+    u32 tsc_limit{};
+    bool linked_tsc{};
 };
 
 /// A texture handle word a draw read, and where.
@@ -376,6 +386,8 @@ public:
 
     /// Refresh the state for graphics/compute image view and sampler descriptors
     void SynchronizeDescriptors(bool compute);
+    /// The compute half from pools given by value (GPURender playing an unlent dispatch).
+    void SynchronizeComputeDescriptors(const ComputePools& pools);
 
     /// Updates the Render Targets if they can be rescaled
     /// @retval True if the Render Targets have been rescaled.
@@ -596,6 +608,9 @@ private:
     /// Find or create an image view for the depth buffer
     [[nodiscard]] ImageViewId FindDepthBuffer();
 
+    [[nodiscard]] bool UsePaddedTargetWidths() const;
+    void ClipPaddedTarget(ImageInfo& info) const;
+
     /// Find or create a view for a render target with the given image parameters
     [[nodiscard]] ImageViewId FindRenderTargetView(const ImageInfo& info, GPUVAddr gpu_addr);
 
@@ -636,6 +651,7 @@ private:
 
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);
+    void InvalidateXc2LutViews(ImageBase& image);
 
     /// Per image view, the (channel, descriptor) entries of the channels' image_views maps that
     /// point to it. Deleting an image erased them by scanning every map (title 1: ~5,000 entries,
@@ -886,6 +902,7 @@ private:
     bool is_rescaling = false;
     /// The bound depth target is wider than tall by padding only (see FindDepthBuffer).
     bool depth_target_padded = false;
+    RenderTargetClip render_target_clip;
     u64 total_used_memory = 0;
     u64 minimum_memory;
     u64 expected_memory;

@@ -489,7 +489,7 @@ struct Values {
                                       Specialization::Default, true, true};
 
     SwitchableSetting<FrameGenType> frame_gen_type{linkage,
-                                                   FrameGenType::Fsr3,
+                                                   FrameGenType::OpticalFlow,
                                                    "frame_gen_type",
                                                    Category::Renderer,
                                                    Specialization::Default,
@@ -550,6 +550,15 @@ struct Values {
                                                         true,
                                                         false,
                                                         &frame_gen};
+
+    SwitchableSetting<bool> frame_gen_flyhigh_protect_hud{linkage,
+                                                          true,
+                                                          "frame_gen_flyhigh_protect_hud",
+                                                          Category::Renderer,
+                                                          Specialization::Default,
+                                                          true,
+                                                          false,
+                                                          &frame_gen};
 
     SwitchableSetting<bool> frame_gen_dump_flow{linkage, false, "frame_gen_dump_flow",
                                                 Category::Renderer};
@@ -773,6 +782,12 @@ struct Values {
                                                   Specialization::Default,
                                                   true,
                                                   true};
+
+    // The GPU render thread (video_core/gpu_split.cpp, the render follower): records Vulkan
+    // commands off the GPU back thread. Experimental, so off by default; EDEN_NX2_RENDER_FOLLOWER
+    // overrides it either way.
+    SwitchableSetting<bool> render_thread{linkage, false, "render_thread",
+                                          Category::RendererAdvanced};
 
 #ifdef __ANDROID__
     SwitchableSetting<bool> use_optimized_vertex_buffers{linkage,

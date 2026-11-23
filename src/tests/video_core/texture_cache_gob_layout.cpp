@@ -5,10 +5,12 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/page_table.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "core/hle/kernel/k_process.h"
@@ -130,6 +132,10 @@ VideoCommon::ImageInfo MakeInfo() {
 namespace VideoCommon {
 
 struct TextureCacheTestAccess {
+    template <class C, class F>
+    static void ForEachSparseSegment(C& cache, ImageBase& image, F&& func) {
+        cache.ForEachSparseSegment(image, std::forward<F>(func));
+    }
     template <class C>
     static ImageId Insert(C& cache, const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
         const auto id = cache.slot_images.insert(cache.runtime, info, gpu_addr, cpu_addr);
@@ -155,6 +161,28 @@ struct TextureCacheTestAccess {
     template <class C>
     static const ImageInfo& Info(C& cache, ImageId id) {
         return cache.slot_images[id].info;
+    }
+    template <class C>
+    static void CacheLutView(C& cache, ImageId id, const Tegra::Texture::TICEntry& tic) {
+        auto& channel = *cache.channel_state;
+        auto& image = cache.slot_images[id];
+        const auto view = cache.FindOrEmplaceImageView(id, ImageViewInfo{tic, 0});
+        image.xc2_lut_view = true;
+        channel.image_views.emplace(tic, view);
+        cache.image_view_descriptors[view].emplace_back(cache.current_channel_id, tic);
+    }
+    template <class C>
+    static bool HasCachedView(C& cache, const Tegra::Texture::TICEntry& tic) {
+        return cache.channel_state->image_views.contains(tic);
+    }
+    template <class C>
+    static u64 DescriptorRevision(C& cache) {
+        return cache.channel_state->graphics_image_table.changes;
+    }
+    template <class C>
+    static void LinkOverlap(C& cache, ImageId left, ImageId right) {
+        cache.slot_images[left].overlapping_images.push_back(right);
+        cache.slot_images[right].overlapping_images.push_back(left);
     }
 };
 
@@ -215,6 +243,30 @@ struct Fixture {
 };
 
 } // namespace
+
+TEST_CASE("Sparse texture iteration skips segments that cannot be translated",
+          "[video_core][texture_cache][sparse_segments]") {
+    Fixture f;
+    constexpr GPUVAddr gpu_addr = 0x200000;
+    constexpr size_t page_size = 0x1000;
+    constexpr DAddr invalid_addr = DAddr{1} << Tegra::MaxwellDeviceMemoryManager::AS_BITS;
+    constexpr DAddr valid_addr = 0x20000;
+    f.memory->Map(gpu_addr, invalid_addr, page_size, Tegra::PTEKind::PITCH, false);
+    f.memory->Map(gpu_addr + page_size, valid_addr, page_size, Tegra::PTEKind::PITCH, false);
+
+    VideoCommon::ImageBase image{MakeInfo(), gpu_addr, valid_addr};
+    REQUIRE(f.memory->GetSubmappedRange(gpu_addr, image.guest_size_bytes).size() == 2);
+    REQUIRE_FALSE(f.memory->GpuToCpuAddress(gpu_addr));
+
+    size_t visited{};
+    Access::ForEachSparseSegment(*f.cache, image, [&](GPUVAddr address, DAddr device, size_t size) {
+        ++visited;
+        CHECK(address == gpu_addr + page_size);
+        CHECK(device == valid_addr);
+        CHECK(size == page_size);
+    });
+    CHECK(visited == 1);
+}
 
 TEST_CASE("FindImage keeps GOB and native tiling images apart at one address",
           "[video_core][texture_cache][gob_layout]") {
@@ -358,5 +410,82 @@ TEST_CASE("Hinted BC7 lookup waits for GPU-written native overlap bytes",
         CHECK(Access::Find(*f.cache, gob, gpu_addr) == hinted);
         CHECK(f.runtime.downloads == 0);
         CHECK(f.bytes[0x40] == 0x73);
+    }
+}
+
+TEST_CASE("Cached XC2 LUT layout is invalidated by a conflicting write",
+          "[video_core][texture_cache][gob_layout]") {
+    using namespace VideoCommon;
+    using namespace Tegra::Texture;
+
+    Fixture f;
+    const u64 saved_program_id = Settings::GetCurrentProgramID();
+    SCOPE_EXIT { Settings::SetCurrentProgramID(saved_program_id); };
+    Settings::SetCurrentProgramID(Xc2ProgramId);
+    constexpr GPUVAddr gpu_addr = 0x100000;
+    constexpr DAddr cpu_addr = 0x10000;
+    TICEntry tic{};
+    tic.address_low = gpu_addr;
+    tic.format.Assign(TextureFormat::A8B8G8R8);
+    tic.r_type.Assign(ComponentType::UNORM);
+    tic.g_type.Assign(ComponentType::UNORM);
+    tic.b_type.Assign(ComponentType::UNORM);
+    tic.a_type.Assign(ComponentType::UNORM);
+    tic.texture_type.Assign(TextureType::Texture3D);
+    tic.header_version.Assign(TICHeaderVersion::BlockLinear);
+    tic.load_store_hint.Assign(1);
+    tic.width_minus_one.Assign(15);
+    tic.height_minus_1.Assign(15);
+    tic.depth_minus_1.Assign(15);
+    auto native = ImageInfo{tic};
+    native.native_tiling = true;
+    auto maxwell = native;
+    maxwell.native_tiling = false;
+    maxwell.maxwell_gob_layout = true;
+    auto& cache = *f.cache;
+    const auto target = Access::Insert(cache, native, gpu_addr, cpu_addr);
+    const auto lookup = Access::Insert(cache, maxwell, gpu_addr, cpu_addr);
+    Access::LinkOverlap(cache, target, lookup);
+    cache.MarkModification(target);
+    Access::CacheLutView(cache, target, tic);
+    const auto revision = Access::DescriptorRevision(cache);
+    REQUIRE(Access::HasCachedView(cache, tic));
+
+    SECTION("A render to the same native target keeps the selected view") {
+        cache.MarkModification(target);
+        CHECK(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) == revision);
+    }
+    SECTION("A guest write forces unchanged descriptors to resolve the layout again") {
+        cache.WriteMemory(cpu_addr, CalculateGuestSizeInBytes(native));
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to the Maxwell overlap invalidates the native view") {
+        cache.MarkModification(lookup);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to another non-native overlap also invalidates the native view") {
+        maxwell.maxwell_gob_layout = false;
+        const auto other = Access::Insert(cache, maxwell, gpu_addr, cpu_addr);
+        Access::LinkOverlap(cache, target, other);
+        cache.MarkModification(other);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > revision);
+    }
+    SECTION("A GPU write to the native overlap invalidates the Maxwell view") {
+        cache.MarkModification(lookup);
+        REQUIRE_FALSE(Access::HasCachedView(cache, tic));
+        Access::CacheLutView(cache, lookup, tic);
+        const auto maxwell_revision = Access::DescriptorRevision(cache);
+
+        cache.MarkModification(lookup);
+        CHECK(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) == maxwell_revision);
+
+        cache.MarkModification(target);
+        CHECK_FALSE(Access::HasCachedView(cache, tic));
+        CHECK(Access::DescriptorRevision(cache) > maxwell_revision);
     }
 }

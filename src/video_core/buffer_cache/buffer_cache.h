@@ -214,6 +214,7 @@ void BufferCache<P>::TickFrame() {
         RunGarbageCollector(total_used_memory >= critical_memory);
     }
     ++frame_tick;
+    VideoCommon::GpuSplit::Get().CheckBufferFree();
     delayed_destruction_ring.Tick();
 
     // Pages draws wrote: their early downloads, now that the frame's work is recorded.
@@ -294,27 +295,40 @@ void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size, bool keep_page_gpu
     // guest CPU writes come through TryCacheInvalidation, which sends such pages to the GPU thread.
     const DAddr page_begin = Common::AlignDown(device_addr, DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(device_addr + size, DEVICE_PAGESIZE);
-    if (keep_page_gpu_data &&
-        VideoCommon::GpuSplit::OwnsScheduler() &&
-        gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+    if (keep_page_gpu_data && gpu_modified_ranges.Intersects(page_begin, page_end - page_begin)) {
+        const bool owner = VideoCommon::GpuSplit::OwnsScheduler();
+        // EDEN_NX2_RENDER_GATHER_E: the back uploads too, its commands collected for GPURender.
+        bool collects = false;
+        if constexpr (requires { runtime.CollectsCommands(); }) {
+            collects = runtime.CollectsCommands();
+        }
         // Switch 2 titles: upload the CPU's bytes into the buffer instead, as CachedWriteMemory
         // does, so the page stays GPU-owned and nothing waits for the host GPU.
-        static const int forced = [] {
-            const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
-            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
-        }();
-        const bool inline_writes =
-            forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
-        if (inline_writes && IsRegionRegistered(device_addr, size)) {
+        if ((owner || collects) && InlinesPageWrite(device_addr, size)) {
             tmp_buffer.resize_destructive(size);
             device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
             InlineMemoryImplementation(device_addr, size, tmp_buffer);
             return;
         }
-        DownloadMemory(page_begin, page_end - page_begin);
+        if (owner) {
+            DownloadMemory(page_begin, page_end - page_begin);
+        } else if (VideoCommon::GpuSplit::OnBackThread()) {
+            VideoCommon::GpuSplit::Get().NoteGpuPageOffOwner();
+        }
     }
     memory_tracker.MarkRegionAsCpuModified(device_addr, size);
     MarkVertexBuffersStale(device_addr, size);
+}
+
+template <class P>
+bool BufferCache<P>::InlinesPageWrite(DAddr device_addr, u64 size) {
+    static const int forced = [] {
+        const char* value = std::getenv("EDEN_NX2_INLINE_PAGE_WRITES");
+        return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
+    }();
+    const bool inline_writes =
+        forced >= 0 ? forced == 1 : Tegra::g_nx2_ampere.load(std::memory_order_relaxed);
+    return inline_writes && IsRegionRegistered(device_addr, size);
 }
 
 template <class P>
@@ -1605,6 +1619,7 @@ std::pair<typename P::Buffer*, u32> BufferCache<P>::ObtainCPUBuffer(
 template <class P>
 void BufferCache<P>::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::BindGraphicsUniformBuffer");
     const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
     if (!device_addr) {
         channel_state->uniform_buffers[stage][index] = NULL_BINDING;
@@ -1630,6 +1645,7 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 
 template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateGraphicsBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateGraphicsBuffers(is_indexed);
@@ -1638,6 +1654,7 @@ void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
 
 template <class P>
 void BufferCache<P>::UpdateComputeBuffers() {
+    VideoCommon::GpuSplit::BackOwned("BufferCache::UpdateComputeBuffers");
     do {
         channel_state->has_deleted_buffers = false;
         DoUpdateComputeBuffers();
@@ -1877,6 +1894,15 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             return false;
         }
         ssbo_addr = holder + indirect_offset;
+        if constexpr (requires { runtime.Nx2Owes(DAddr{}, u64{}); }) {
+            // An unlent draw's back reads the entry itself: its constant buffers were checked.
+            if (VideoCommon::GpuSplit::Unlends()) {
+                const auto device = gpu_memory->GpuToCpuAddress(ssbo_addr);
+                if (device && runtime.Nx2Owes(*device, 2 * sizeof(u64))) {
+                    VideoCommon::GpuSplit::Get().NoteOwedTableRead();
+                }
+            }
+        }
     }
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
     const bool indirect = indirect_offset != ~0U;
@@ -2488,7 +2514,7 @@ void BufferCache<P>::BindHostVertexBuffers() {
             enabled_mask &= (enabled_mask - 1);
             const Binding& binding = VertexBufferSlot(index);
             Buffer& buffer = slot_buffers[binding.buffer_id];
-            TouchBuffer(buffer, binding.buffer_id);
+            TouchBufferOnce(vertex_touches[index], buffer, binding.buffer_id);
             SynchronizeGeometryBuffer(index, binding.buffer_id, binding.device_addr, binding.size);
             if (!flags[Dirty::VertexBuffer0 + index]) {
                 flush_bindings();
@@ -2610,7 +2636,6 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
     const DAddr device_addr = binding.device_addr;
     const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
     Buffer& buffer = slot_buffers[binding.buffer_id];
-    TouchBuffer(buffer, binding.buffer_id);
     const bool has_host_buffer = binding.buffer_id != NULL_BUFFER_ID;
     // Native programs keep tables next to their code in a 64 KiB bank read with indirect offsets
     // (Splatoon Raiders: the dialogue box corners in c1). Writes to that memory can go unnoticed by
@@ -2649,6 +2674,9 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         uniform_keep.clean[stage] &= ~(1u << index);
     }
+    // A kept range binds a stream allocation, not the buffer: the buffer is touched once it is
+    // read.
+    TouchBufferOnce(uniform_touches[stage][index], buffer, binding.buffer_id);
     const u32 offset = has_host_buffer ? buffer.Offset(device_addr) : 0;
     const bool needs_alignment_stream = [&]() {
         if constexpr (IS_OPENGL) {
@@ -2790,10 +2818,27 @@ void BufferCache<P>::ResolveMultiRangeStorage(Binding& binding, bool is_written,
         if (is_written && !runtime.PrefersSparseSources()) {
             return;
         }
+        // Ranges found in one segment, until a map changes: the query is a hash lookup, for
+        // every storage binding of every draw.
+        const u64 map_serial = gpu_memory->MapSerial();
+        SingleRangeMemo& memo = single_ranges[(binding.gpu_addr >> 8) % single_ranges.size()];
+        const bool memo_hit = memo.memory == gpu_memory && memo.map_serial == map_serial &&
+                              memo.gpu_addr == binding.gpu_addr && binding.size <= memo.size;
+        if (memo_hit && !Nx2Perf::Verify()) {
+            return;
+        }
         const VirtualSegments* found =
             virtual_ranges.Query(*gpu_memory, binding.gpu_addr, binding.size);
         if (!found || found->size() < 2) {
+            // No segments also means a gap: a shorter range at the address may still be split.
+            if (found && found->size() == 1) {
+                memo = {gpu_memory, map_serial, binding.gpu_addr, binding.size};
+            }
             return;
+        }
+        if (memo_hit) {
+            LOG_ERROR(HW_GPU, "Nx2Perf storage range: {:#x}+{:#x} remembered in one segment, has {}",
+                      binding.gpu_addr, binding.size, found->size());
         }
         const VirtualSegments segments = *found;
         const u32 first = static_cast<u32>(pool.size());
@@ -3177,6 +3222,15 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
         return;
     }
     const auto& array = maxwell3d->regs.vertex_streams[index];
+    if (array.enable == 0) {
+        // Nothing binds a disabled stream (BindHostVertexBuffers takes the enabled ones), so its
+        // flag stayed set and every later change of another stream resolved it again: Donkey
+        // Kong Bananza enables 10 of 32 and resolved ~13 streams a draw.
+        maxwell3d->dirty.flags[Dirty::VertexBuffer0 + index] = false;
+        channel_state->vertex_buffers[index] = NULL_BINDING;
+        UpdateVertexBufferSlot(index, NULL_BINDING);
+        return;
+    }
     const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
     const GPUVAddr gpu_addr_begin = array.Address();
     const bool native = maxwell3d->GetNativeMacroEngine().native_turing;
@@ -3634,24 +3688,42 @@ BufferId BufferCache<P>::FindBuffer(DAddr device_addr, u32 size, bool sparse_com
     if (device_addr == 0 || page >= page_table.size()) {
         return NULL_BUFFER_ID;
     }
+    // A recent result for the page, found without touching the buffer (draws look up ~20 ranges
+    // each). Only a deletion takes a buffer off the page table: a bigger one joining it deletes it.
+    const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
+    FindMemo& memo = find_memos[page % find_memos.size()];
+    const bool memo_hit = !should_sync && memo.page == page &&
+                          memo.deletions == buffer_deletions && device_addr >= memo.begin &&
+                          device_addr + size <= memo.end &&
+                          (memo.sparse_compatible || !sparse_compatible);
+    if (memo_hit && !Nx2Perf::Verify()) {
+        return memo.buffer_id;
+    }
     const BufferId buffer_id = page_table[page];
     if (buffer_id) {
         Buffer& buffer = slot_buffers[buffer_id];
         if (buffer.IsInBounds(device_addr, size)) {
-            const bool should_sync = Settings::IsGPUFenceBehaviorAccurate();
             if (should_sync) {
                 SynchronizeBufferWrites(buffer);
             }
-            bool usable = true;
+            bool sparse = true;
             if constexpr (requires { buffer.IsSparseCompatible(); }) {
-                if (sparse_compatible && !buffer.IsSparseCompatible()) {
-                    usable = false;
-                }
+                sparse = buffer.IsSparseCompatible();
             }
-            if (usable) {
+            if (!sparse_compatible || sparse) {
+                if (memo_hit && memo.buffer_id != buffer_id) {
+                    LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, found in {}",
+                              device_addr, size, memo.buffer_id.index, buffer_id.index);
+                }
+                memo = {page, buffer_deletions, buffer.CpuAddr(),
+                        buffer.CpuAddr() + buffer.SizeBytes(), buffer_id, sparse};
                 return buffer_id;
             }
         }
+    }
+    if (memo_hit) {
+        LOG_ERROR(HW_GPU, "Nx2Perf find buffer: {:#x}+{:#x} remembered in {}, not in the page table",
+                  device_addr, size, memo.buffer_id.index);
     }
     return CreateBuffer(device_addr, size, sparse_compatible, caller);
 }
@@ -3887,6 +3959,16 @@ template <class P>
 void BufferCache<P>::TouchBuffer(Buffer& buffer, BufferId buffer_id) noexcept {
     if (buffer_id != NULL_BUFFER_ID) {
         lru_cache.Touch(buffer.getLRUID(), frame_tick);
+    }
+}
+
+template <class P>
+void BufferCache<P>::TouchBufferOnce(TouchMemo& memo, Buffer& buffer, BufferId buffer_id) noexcept {
+    // The collector goes by the frame of a buffer's last touch: one a frame is enough.
+    if (memo.frame != frame_tick || memo.buffer_id != buffer_id ||
+        memo.deletions != buffer_deletions) {
+        memo = {frame_tick, buffer_id, buffer_deletions};
+        TouchBuffer(buffer, buffer_id);
     }
 }
 

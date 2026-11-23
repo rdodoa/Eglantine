@@ -339,6 +339,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
 
         info.dual_source_blend = key.state.attachment0_dual_source_blend != 0;
 
+        const auto zeta_format{static_cast<Tegra::DepthFormat>(key.state.depth_format.Value())};
+        info.quantize_frag_depth_d24 = key.state.depth_enabled != 0 &&
+                                       !device.SupportsD24DepthBuffer() &&
+                                       (zeta_format == Tegra::DepthFormat::Z24_UNORM_S8_UINT ||
+                                        zeta_format == Tegra::DepthFormat::X8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::S8Z24_UNORM ||
+                                        zeta_format == Tegra::DepthFormat::V8Z24_UNORM);
+
         if (device.IsMoltenVK()) {
             for (size_t i = 0; i < 8; ++i) {
                 const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
@@ -1021,14 +1029,31 @@ void PipelineCache::SaveUsedPipelines() {
                               VideoCommon::ShaderCacheV2::EncodeUsed(record));
 }
 
-GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
+GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(bool key_unchanged) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentGraphicsPipeline");
 
+    if (VideoCommon::GpuSplit::TracksGraphicsLookups()) {
+        ++graphics_lookups;
+        last_lookup_kept = false;
+    }
+    std::array<u64, 6> hashes;
+    if (key_unchanged) {
+        hashes = graphics_key.unique_hashes;
+    }
     if (!RefreshStages(graphics_key.unique_hashes)) {
         current_pipeline = nullptr;
         return nullptr;
     }
     const bool mesh_draw =
         maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled();
+    // Refresh would rebuild the key current_pipeline was found with: same registers, programs and
+    // topology (its parts kept behind dirty flags come from the same registers).
+    if (key_unchanged && current_pipeline != nullptr && !mesh_draw && !vertex_input_lent &&
+        hashes == graphics_key.unique_hashes) {
+        last_lookup_kept = true;
+        current_pipeline->MarkUsed(frame_count);
+        return BuiltPipeline(current_pipeline);
+    }
     if (vertex_input_lent && !mesh_draw) {
         // Refresh keeps the key's vertex input until the registers change it.
         vertex_input_lent = false;
@@ -1137,6 +1162,7 @@ bool PipelineCache::StaleNullPointerSlot(const ComputePipelineCacheEntry& entry)
 }
 
 ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::CurrentComputePipeline");
 
     const ShaderInfo* const shader{ComputeShader()};
     if (!shader) {
@@ -1209,6 +1235,36 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
     }
     return entry.Get(kepler_compute->IsNativeMode(),
                      kepler_compute->regs.code_loc.Address() + qmd.program_start, key);
+}
+
+ComputePipeline* PipelineCache::UnlentComputePipeline(u64& native_key) {
+    VideoCommon::GpuSplit::BackOwned("PipelineCache::UnlentComputePipeline");
+    const ShaderInfo* const shader{KnownComputeShader()};
+    if (!shader) {
+        return nullptr;
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    const ComputePipelineCacheKey key{
+        .unique_hash = shader->unique_hash,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+    };
+    const auto it{compute_cache.find(key)};
+    if (it == compute_cache.end()) {
+        return nullptr;
+    }
+    ComputePipelineCacheEntry& entry{it->second};
+    if (!entry.pipeline || entry.pending_rebuild ||
+        (!entry.null_pointer_slots.empty() && entry.rebuilds < MaxComputeRebuilds &&
+         StaleNullPointerSlot(entry)) ||
+        !KnownComputeShaderChecks(shader)) {
+        return nullptr;
+    }
+    native_key = shader->lowered_native ? shader->lowered_native->native_program_key : 0;
+    if (VideoCommon::StutterTrace::Enabled() && !std::exchange(entry.used, true)) {
+        VideoCommon::StutterTrace::CountLookup(VideoCommon::StutterTrace::Lookup::ComputePrebuilt);
+    }
+    return entry.pipeline.get();
 }
 
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
@@ -1302,8 +1358,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
 
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     const bool precache =
-        ShaderWarm::PrecacheBeforeStart(Settings::values.precache_shaders.GetValue(),
-                                        ShaderWarm::TakeWarmBeforeStart()) &&
+        ShaderWarm::PrecacheBeforeStart(
+            Settings::values.precache_shaders.GetValue(), ShaderWarm::TakeWarmBeforeStart(),
+            ShaderWarm::WarmRequested(ShaderWarm::ComputeWarmPath(title_id))) &&
         build_at_boot;
     if (use_vulkan_pipeline_cache) {
         vulkan_pipeline_cache_filename =
@@ -1317,6 +1374,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         vulkan_pipeline_cache =
             LoadVulkanPipelineCache(vulkan_pipeline_cache_filename, CACHE_VERSION);
+        if (!vulkan_pipeline_cache_restored) {
+            // The precache progress names builds the lost cache held. Dropped before the empty
+            // cache is saved, which would make the progress readable again at the next boot.
+            std::error_code ec;
+            std::filesystem::remove(
+                ShaderWarm::WarmProgressPath(ShaderWarm::ComputeWarmPath(title_id)), ec);
+        }
     }
     if (boot_lock.Held() && !Common::FS::NewFile(boot_marker)) {
         LOG_WARNING(Common_Filesystem, "Couldn't create {}",
@@ -1586,9 +1650,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     size_t compute_records = 0;
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
-    // build_all_cached_shaders: the rest too, in the room the recent sessions' pipelines leave
-    // under the pipelines kept built
-    const bool build_all = Settings::values.build_all_cached_shaders.GetValue();
+    // build_all_cached_shaders, or a game whose shaders the user asked to precompile: the rest
+    // too, in the room the recent sessions' pipelines leave under the pipelines kept built
+    const bool build_all =
+        Settings::values.build_all_cached_shaders.GetValue() ||
+        VideoCommon::ShaderWarm::WarmRequested(VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
     const size_t kept_pipelines = KeptPipelines();
     const size_t boot_used =
         used_pipelines.empty() ? MaxPipelinesWithoutUsedList : used_pipelines.size();
@@ -1832,8 +1898,13 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
                 }
                 bool incomplete{};
                 try {
-                    return TranslateCachedGraphics(record.payload, record.key, nullptr,
-                                                   incomplete);
+                    auto pipeline = TranslateCachedGraphics(record.payload, record.key, nullptr,
+                                                            incomplete);
+                    if (incomplete) {
+                        std::scoped_lock lock{incomplete_prebuilds_mutex};
+                        incomplete_prebuilds.insert(record.key.Hash());
+                    }
+                    return pipeline;
                 } catch (const std::ios_base::failure&) {
                     return std::unique_ptr<GraphicsPipeline>{};
                 }
@@ -2002,10 +2073,11 @@ namespace {
 /// The precache marker's variant: the build's SPIR-V emission stamp and the settings that change
 /// what the driver gets for a precache build. Resolution scaling bakes the scale into the
 /// rescaling code of the shaders; the loop safety checks and the bloom fix change the SPIR-V; the
-/// debug setting adds a create flag.
-u64 WarmVariant() {
+/// debug setting adds a create flag. `persisted`: whether the builds outlive the run, so neither
+/// the marker nor the progress of a run whose builds were dropped is taken by one that keeps them.
+u64 WarmVariant(bool persisted) {
     const auto& resolution = Settings::values.resolution_info;
-    const std::array<u64, 7> inputs{
+    const std::array<u64, 8> inputs{
         VideoCommon::ShaderWarm::EmissionStamp(),
         resolution.active ? 1ULL : 0ULL,
         resolution.up_scale,
@@ -2013,6 +2085,7 @@ u64 WarmVariant() {
         Settings::values.disable_shader_loop_safety_checks.GetValue() ? 1ULL : 0ULL,
         Settings::values.fix_bloom_effects.GetValue() ? 1ULL : 0ULL,
         Settings::values.renderer_debug.GetValue() ? 1ULL : 0ULL,
+        persisted ? 1ULL : 0ULL,
     };
     return Common::CityHash64(reinterpret_cast<const char*>(inputs.data()), sizeof(inputs));
 }
@@ -2024,9 +2097,18 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     std::vector<PrecacheJob> jobs;
     const std::filesystem::path warm_file = ShaderWarm::ComputeWarmPath(title_id);
     const std::string path = Common::FS::PathToUTF8String(warm_file);
+    // The pipelines built here outlive the run only in the driver's own cache or in the Vulkan
+    // pipeline cache saved below; progress is recorded and reused only then. Progress kept in the
+    // Vulkan pipeline cache is written once that cache is saved, and read only when this boot's
+    // cache was read back from the file.
+    const bool driver_cache = device.DriverCachesPipelines();
+    const bool vulkan_cache = use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty();
+    const bool persisted = driver_cache || vulkan_cache;
+    const bool progress_kept = driver_cache || (vulkan_cache && vulkan_pipeline_cache_restored);
     const auto stamp = [&](u64 entries) {
         return ShaderWarm::CurrentWarmStamp(warm_file, entries, device.GetDriverVersion(),
-                                            device.GetDeviceID(), CACHE_VERSION, WarmVariant());
+                                            device.GetDeviceID(), CACHE_VERSION,
+                                            WarmVariant(persisted));
     };
     // Compute programs of the precache file, unless a matching marker says they were built.
     size_t file_entries = 0;
@@ -2034,11 +2116,19 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     std::error_code ec;
     const auto current = stamp(0);
     const auto marker = ShaderWarm::ReadWarmMarker(warm_file);
+    // Built by a precache of the same file and driver that was skipped or stopped
+    std::unordered_set<u64> built_before;
+    std::vector<u64> job_keys;
+    // Entries whose exact key the title's cache already holds: the warm hits of earlier play
+    size_t in_cache = 0;
     if (!std::filesystem::exists(warm_file, ec)) {
         LOG_INFO(Render_Vulkan, "Shader precache: no precache file at {}", path);
     } else if (current && marker && marker->Matches(*current)) {
         LOG_INFO(Render_Vulkan, "Shader precache: compute programs already done for this driver");
     } else {
+        if (current && progress_kept) {
+            built_before = ShaderWarm::ReadWarmProgress(warm_file, *current);
+        }
         // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
         try {
             std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
@@ -2074,10 +2164,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 ComputePipelineCacheKey key;
                 file.read(reinterpret_cast<char*>(&key), sizeof(key));
                 ++file_entries;
-                // Programs already in the disk cache were built above; leave them out.
+                // Programs already in the disk cache were built above, and those an earlier
+                // precache built before it was skipped are in the driver's cache; leave them out.
                 if (compute_cache.contains(key)) {
+                    ++in_cache;
                     continue;
                 }
+                if (built_before.contains(key.Hash())) {
+                    continue;
+                }
+                job_keys.push_back(key.Hash());
                 const u64 cpu_bytes = TranslationBytes(env.MemorySize());
                 jobs.push_back({
                     .translate = [this, key,
@@ -2092,7 +2188,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                         }
                         return [pipeline = std::move(pipeline)] {
                             pipeline->Build();
-                            return true;
+                            return pipeline->IsBound();
                         };
                     },
                     .cpu_bytes = cpu_bytes,
@@ -2102,6 +2198,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
         } catch (const std::exception& e) {
             LOG_WARNING(Render_Vulkan, "Shader precache: reading {} failed: {}", path, e.what());
             jobs.clear();
+            job_keys.clear();
             file_entries = 0;
         }
     }
@@ -2115,8 +2212,11 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
     std::vector<u8> built(jobs.size());
     std::atomic<size_t> done{};
     bool skipped = false;
-    LOG_INFO(Render_Vulkan, "Shader precache: {} of {} compute programs to build on {} threads",
-             jobs.size(), file_entries, num_threads);
+    LOG_INFO(Render_Vulkan,
+             "Shader precache: {} of {} compute programs to build on {} threads ({} of the "
+             "title's {} cached compute pipelines in the file, {} built by an earlier precache)",
+             jobs.size(), file_entries, num_threads, in_cache, compute_cache.size(),
+             built_before.size());
     VideoCommon::StutterTrace::BootMarker("precache_begin", fmt::format("jobs={}", jobs.size()));
     if (!jobs.empty()) {
         // Background jobs of the shader workers, each built and destroyed: only the driver's
@@ -2175,11 +2275,29 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
         if (const auto stamp_done = stamp(file_entries)) {
             ShaderWarm::WriteWarmMarker(warm_file, *stamp_done);
         }
+        std::filesystem::remove(ShaderWarm::WarmProgressPath(warm_file), ec);
+    }
+    std::function<void()> commit_progress;
+    if (compute_pending && skipped && current && persisted && total_built != 0 &&
+        !stop_loading.stop_requested()) {
+        // A closed load saves no Vulkan pipeline cache below.
+        for (size_t index = 0; index < jobs.size(); ++index) {
+            if (built[index]) {
+                built_before.insert(job_keys[index]);
+            }
+        }
+        commit_progress = [warm_file, at = *current, keys = std::move(built_before)] {
+            ShaderWarm::WriteWarmProgress(warm_file, at, keys);
+        };
+        if (!vulkan_cache) {
+            commit_progress();
+            commit_progress = {};
+        }
     }
     if (!stop_loading.stop_requested() && total_built != 0) {
         // Without this, the builds reach the file only at the next boot, game change or clean
         // close, and are lost if the app ends otherwise.
-        QueueVulkanPipelineCacheSave();
+        QueueVulkanPipelineCacheSave(std::move(commit_progress));
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
@@ -2221,13 +2339,18 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     });
 }
 
-void PipelineCache::QueueVulkanPipelineCacheSave() {
+void PipelineCache::QueueVulkanPipelineCacheSave(std::function<void()> after_save) {
     if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
         return;
     }
-    const auto save = [this] {
-        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
-                                     CACHE_VERSION);
+    const auto save = [this, after_save = std::move(after_save)] {
+        if (!SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                          CACHE_VERSION)) {
+            return;
+        }
+        if (after_save) {
+            after_save();
+        }
         size_t size = 0;
         vulkan_pipeline_cache.Read(&size, nullptr);
         last_cache_size.store(size, std::memory_order_relaxed);
@@ -2634,16 +2757,27 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
     const bool depth_tested =
-        native ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
-                     regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
-                     ColorWritesHaveHistory(
-                         std::min<u32>(regs.rt_control.count,
-                                       static_cast<u32>(Maxwell::NumRenderTargets)),
-                         [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
-                         [this](u32 rt_index) {
-                             return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                         })
-               : regs.zeta_enable != 0;
+        native
+            ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
+                  regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
+                  ColorWritesHaveHistory(
+                      std::min<u32>(regs.rt_control.count,
+                                    static_cast<u32>(Maxwell::NumRenderTargets)),
+                      [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
+                      [this](u32 rt_index) {
+                          if (!VideoCommon::GpuSplit::LendsToRender()) {
+                              return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+                          }
+                          // An unlent draw's lookup asks GPURender's texture cache.
+                          auto& split = VideoCommon::GpuSplit::Get();
+                          split.NoteLookupLend();
+                          bool written{};
+                          split.LendRender([&] {
+                              written = texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+                          });
+                          return written;
+                      })
+            : regs.zeta_enable != 0;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(
         native, depth_tested, draw_state.draw_element_count, draw_state.draw_element_count,
@@ -3564,7 +3698,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     if (!pipeline || pipeline_cache_filename.empty()) {
         return pipeline;
     }
-    if (disk_pipelines.contains(graphics_key.Hash())) {
+    const bool incomplete_record = [&] {
+        std::scoped_lock lock{incomplete_prebuilds_mutex};
+        return incomplete_prebuilds.erase(graphics_key.Hash()) != 0;
+    }();
+    if (disk_pipelines.contains(graphics_key.Hash()) && !incomplete_record) {
         // In the disk cache already, only not built at boot.
         QueueVulkanPipelineCacheFlush();
         return pipeline;
@@ -3751,7 +3889,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     return {.failure = exception.what()};
 }
 
-void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
+bool PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,
                                                  u32 cache_version) {
     // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
@@ -3762,7 +3900,7 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     if (!file.is_open()) {
         LOG_ERROR(Common_Filesystem, "Failed to open Vulkan driver pipeline cache file {}",
                   Common::FS::PathToUTF8String(temporary));
-        return;
+        return false;
     }
     try {
         file.exceptions(std::ifstream::failbit);
@@ -3793,7 +3931,7 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         file.close();
         std::error_code remove_error;
         std::filesystem::remove(temporary, remove_error);
-        return;
+        return false;
     }
     std::error_code error;
     std::filesystem::rename(temporary, filename, error);
@@ -3801,11 +3939,12 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         LOG_ERROR(Common_Filesystem, "Failed to replace Vulkan driver pipeline cache file {}: {}",
                   Common::FS::PathToUTF8String(filename), error.message());
         std::filesystem::remove(temporary, error);
-        return;
+        return false;
     }
 
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
              Common::FS::PathToUTF8String(filename));
+    return true;
 }
 
 vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::path& filename,
@@ -3819,6 +3958,7 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
             .pInitialData = data};
         return device.GetLogical().CreatePipelineCache(pipeline_cache_ci);
     };
+    vulkan_pipeline_cache_restored = false;
     try {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
@@ -3866,7 +4006,9 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                  "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
         try {
-            return create_pipeline_cache(cache_size, cache_data.data());
+            auto restored = create_pipeline_cache(cache_size, cache_data.data());
+            vulkan_pipeline_cache_restored = true;
+            return restored;
         } catch (const vk::Exception& e) {
             // The blob came from another driver or driver version (e.g. switching between
             // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of
