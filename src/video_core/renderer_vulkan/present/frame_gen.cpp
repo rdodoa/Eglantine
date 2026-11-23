@@ -347,7 +347,9 @@ void FrameGen::Process(const Device& device, Frame* frame, VkFormat format,
         reported |= REPORTED_RUNNING;
         LOG_INFO(Render_Vulkan, "Frame generation running: {} generated frame(s) per game frame ({})",
                  plan.generations,
-                 type == Settings::FrameGenType::Fsr3 ? "built-in optical flow" : "LSFG");
+                 type == Settings::FrameGenType::OpticalFlow ? "built-in optical flow"
+                 : use_flyhigh                                  ? "FlyHigh"
+                                                                : "LSFG");
     }
     generated_frames.fetch_add(GeneratedFrameCount(), std::memory_order_relaxed);
     LogActivity();
