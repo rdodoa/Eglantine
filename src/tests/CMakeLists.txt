@@ -34,6 +34,7 @@ add_executable(tests
     core/nx2_video_ready.cpp
     core/general_channel.cpp
     core/home_menu.cpp
+    core/window_system.cpp
     core/native_home_bootstrap.cpp
     core/kernel_finish_termination.cpp
     core/nx2_thread_stats.cpp
