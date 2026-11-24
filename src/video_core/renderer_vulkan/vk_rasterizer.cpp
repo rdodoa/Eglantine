@@ -4540,8 +4540,8 @@ bool RasterizerVulkan::BackTakesInvalidation(std::span<const std::pair<DAddr, Si
         }
         return std::nullopt;
     };
-    const auto lend = [&split](Site site) {
-        split.NoteInvalidation(site);
+    const auto lend = [&split](Site lent) {
+        split.NoteInvalidation(lent);
         return false;
     };
     // Shaders are looked up on the back as well: their invalidation stays lent.
