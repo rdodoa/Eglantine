@@ -598,6 +598,11 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
         [this](const std::function<void(DAddr, size_t)>& callback) {
             gpu.ForEachPendingCpuWrite(callback);
         });
+    buffer_cache.SetReadRunPageFilter([this](DAddr addr, u64 size) {
+        return !texture_cache.page_filter.Any(addr, size) &&
+               !query_cache.page_filter.Any(addr, size) &&
+               !buffer_cache_runtime.Nx2Slots().HasOwed();
+    });
     VideoCommon::GpuSplit::Get().SetIdleHook(
         [](void* argument) {
             auto* const rasterizer = static_cast<RasterizerVulkan*>(argument);
@@ -6169,8 +6174,14 @@ void RasterizerVulkan::FlushWork(bool ends_pass) {
         pass_boundary = ends_pass || scheduler.IsBetweenRenderPasses() ||
                         (texture_cache.RenderTargetsDirty() && scheduler.IsRenderPassActive());
     }
-    switch (SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget,
-                                      pass_boundary)) {
+    auto action = SubmissionPolicy::Advance(draw_counter, native, android, budget, legacy_budget,
+                                            pass_boundary);
+    if (action != SubmissionPolicy::Action::Flush && native && !android &&
+        scheduler.IdleGpuAwaitsWork()) {
+        draw_counter = 0;
+        action = SubmissionPolicy::Action::Flush;
+    }
+    switch (action) {
     case SubmissionPolicy::Action::None:
         break;
     case SubmissionPolicy::Action::Dispatch:

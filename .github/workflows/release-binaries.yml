@@ -119,7 +119,7 @@ jobs:
       # The -pgo builds use the repo's profiles: eglantine.profdata on Linux, and
       # lichii-windows.profdata (trained on Ocarina of Time, see docs/CI.md) on Windows.
       matrix:
-        include: ${{ fromJSON(inputs.windows_only && '[{"platform":"windows-x86_64","runner":"windows-2022"}]' || '[{"platform":"linux-x86_64","runner":"ubuntu-24.04"},{"platform":"linux-x86_64-pgo","runner":"ubuntu-24.04","pgo":true},{"platform":"windows-x86_64","runner":"windows-2022"},{"platform":"windows-x86_64-pgo","runner":"windows-2022","pgo":true,"profile":"lichii-windows.profdata"},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm"},{"platform":"linux-aarch64-pgo","runner":"ubuntu-24.04-arm","pgo":true},{"platform":"macos-arm64","runner":"macos-15"}]') }}
+        include: ${{ fromJSON(inputs.windows_only && '[{"platform":"windows-x86_64","runner":"windows-2022"}]' || '[{"platform":"linux-x86_64","runner":"ubuntu-24.04"},{"platform":"linux-x86_64-pgo","runner":"ubuntu-24.04","pgo":true},{"platform":"windows-x86_64","runner":"windows-2022"},{"platform":"windows-x86_64-pgo","runner":"windows-2022","pgo":true,"profile":"lichii-windows.profdata"},{"platform":"linux-aarch64","runner":"ubuntu-24.04-arm"},{"platform":"macos-arm64","runner":"macos-15"}]') }}
 
     steps:
       - name: Check out source
@@ -861,9 +861,11 @@ jobs:
 
           Linux packages come as an AppImage and a tar.gz. Both are self-contained and need glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch). The tar.gz holds the same files unpacked, for systems without FUSE: extract it and run \`lichii/lichii\`.
 
+          Linux ARM64 now ships only the standard build. If you use ARM64 PGO, the in-app updater in build 116 or newer offers the standard package of the same type. If no update appears on an older build, download the standard ARM64 package below.
+
           $({
             row amd64 "$(appimage_tar lichii-linux-x86_64)" "$(appimage_tar lichii-linux-x86_64-pgo)" "Make the AppImage executable (\`chmod +x\`) and run it"
-            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "$(appimage_tar lichii-linux-aarch64-pgo)" ""
+            row "ARM (aarch64)" "$(appimage_tar lichii-linux-aarch64)" "" ""
           } | table)
 
           ## Windows
