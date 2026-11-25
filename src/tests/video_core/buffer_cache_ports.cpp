@@ -1956,8 +1956,8 @@ TEST_CASE("Adjacent read downloads supply the same bytes with fewer host waits",
         REQUIRE(std::all_of(guest + 0x80, guest + 0x1000, [](u8 value) { return value == 0; }));
     }
     CAPTURE(read_runs, f.runtime.host_read_waits);
-    REQUIRE(f.runtime.host_read_barriers == (read_runs ? 1 : 4));
-    REQUIRE(f.runtime.host_read_waits == (read_runs ? 1 : 4));
+    REQUIRE(f.runtime.host_read_barriers == (read_runs ? 1U : 4U));
+    REQUIRE(f.runtime.host_read_waits == (read_runs ? 1U : 4U));
 }
 
 TEST_CASE("Adjacent read downloads stop before a page they cannot take",
