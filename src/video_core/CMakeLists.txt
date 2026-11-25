@@ -304,6 +304,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_shader_util.h
     renderer_vulkan/vk_staging_buffer_pool.cpp
     renderer_vulkan/vk_staging_buffer_pool.h
+    renderer_vulkan/vk_stream_ring.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
     renderer_vulkan/vk_swapchain.cpp

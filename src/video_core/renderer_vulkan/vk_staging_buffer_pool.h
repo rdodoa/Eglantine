@@ -11,6 +11,7 @@
 
 #include "common/common_types.h"
 #include "video_core/buffer_cache/command_arena.h"
+#include "video_core/renderer_vulkan/vk_stream_ring.h"
 
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -101,7 +102,11 @@ private:
 
     StagingBufferRef GetStreamBuffer(size_t size);
 
-    bool AreRegionsActive(size_t region_begin, size_t region_end) const;
+    /// Calls `f` with a predicate saying whether the GPU is past a stream buffer region's tick.
+    /// Without an arena clock it reads the GPU's tick once for the whole scan; with one it asks
+    /// the clock per region.
+    template <typename F>
+    auto WithRegionFree(F&& f) const;
 
     StagingBufferRef GetStagingBuffer(size_t size, MemoryUsage usage, bool deferred = false);
 
@@ -121,10 +126,6 @@ private:
     [[nodiscard]] u64 Now() const noexcept;
     [[nodiscard]] bool IsFree(u64 tick) const noexcept;
 
-    size_t Region(size_t iter) const noexcept {
-        return iter / region_size;
-    }
-
     const Device& device;
     MemoryAllocator& memory_allocator;
     Scheduler& scheduler;
@@ -134,12 +135,8 @@ private:
     VkDeviceAddress stream_buffer_address{};
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;
-    VkDeviceSize region_size;
 
-    size_t iterator = 0;
-    size_t used_iterator = 0;
-    size_t free_iterator = 0;
-    std::array<u64, NUM_SYNCS> sync_ticks{};
+    StreamRing<NUM_SYNCS> stream_ring;
 
     StagingBuffersCache device_local_cache;
     StagingBuffersCache upload_cache;
