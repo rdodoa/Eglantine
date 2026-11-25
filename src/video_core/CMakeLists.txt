@@ -266,8 +266,6 @@ add_library(video_core STATIC
     renderer_vulkan/vk_frame_dump.h
     renderer_vulkan/vk_graphics_pipeline.cpp
     renderer_vulkan/vk_graphics_pipeline.h
-    renderer_vulkan/vk_image_reaper.cpp
-    renderer_vulkan/vk_image_reaper.h
     renderer_vulkan/vk_multi_range_buffer.cpp
     renderer_vulkan/vk_multi_range_buffer.h
     renderer_vulkan/vk_gpu_breadcrumbs.cpp
@@ -399,6 +397,7 @@ add_library(video_core STATIC
     texture_cache/image_view_info.cpp
     texture_cache/image_view_info.h
     texture_cache/memory_limits.h
+    texture_cache/image_view_slots.h
     texture_cache/render_targets.h
     texture_cache/samples_helper.h
     texture_cache/stale_pages.h
