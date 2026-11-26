@@ -156,7 +156,7 @@ TEST_CASE("The stream ring wraps to its start once the GPU is past it",
     // Once the GPU is past tick 1 the ring wraps to its start.
     model.tick = 2;
     model.known = 1;
-    REQUIRE(model.Request(RegionBytes) == 0);
+    REQUIRE(model.Request(RegionBytes) == 0U);
     REQUIRE(model.Request(4096) == RegionBytes);
 }
 
@@ -201,21 +201,21 @@ TEST_CASE("The stream ring checks its start after the out-of-memory path moved t
     REQUIRE(model.Request(RegionBytes - Alignment) == (Regions - 1) * RegionBytes);
     model.known = 1;
     model.tick = 2;
-    REQUIRE(model.Request(8192) == 0);
+    REQUIRE(model.Request(8192) == 0U);
     model.known = 2;
     model.tick = 3;
-    REQUIRE(model.Request(4096) == 8192);
-    REQUIRE(model.Take(15 * RegionBytes) == 12288);
+    REQUIRE(model.Request(4096) == 8192U);
+    REQUIRE(model.Take(15 * RegionBytes) == 12288U);
     REQUIRE_FALSE(model.Request(RegionBytes).has_value());
     // Past tick 3, it wraps.
     model.known = 3;
     model.tick = 4;
-    REQUIRE(model.Request(RegionBytes) == 0);
+    REQUIRE(model.Request(RegionBytes) == 0U);
 }
 
 TEST_CASE("The stream ring refuses a request larger than a region", "[video_core][stream_ring]") {
     Model model;
     REQUIRE(model.ring.RegionSize() == RegionBytes);
     REQUIRE_FALSE(model.Request(RegionBytes + 1).has_value());
-    REQUIRE(model.Request(RegionBytes) == 0);
+    REQUIRE(model.Request(RegionBytes) == 0U);
 }
