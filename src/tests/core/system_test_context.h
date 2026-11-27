@@ -4,6 +4,8 @@
 #pragma once
 
 #include <filesystem>
+#include <stdexcept>
+#include <system_error>
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "tests/common/restore_eden_path.h"
@@ -12,13 +14,24 @@
 class ScopedSystemTestContext {
 public:
     ScopedSystemTestContext() {
+        // The SD card folder is made before either path is redirected: a constructor that throws
+        // does not run the destructor, so nothing may be left redirected if it fails (the folder
+        // itself goes with `directory`).
+        std::error_code error;
+        if (!std::filesystem::create_directory(directory.Path() / "sdmc", error)) {
+            throw std::runtime_error("Cannot create isolated System test directory");
+        }
         Common::FS::SetEdenPath(Common::FS::EdenPath::NANDDir, directory.Path());
+        // Core::System's Reporter empties sdmc/FsAccessLog.txt when it is made: keep that out of
+        // the user's SD card folder too.
+        Common::FS::SetEdenPath(Common::FS::EdenPath::SDMCDir, directory.Path() / "sdmc");
         Settings::values.memory_layout_mode.SetValue(Settings::MemoryLayout::Memory_4Gb);
         Settings::values.use_multi_core.SetValue(false);
     }
 
     ~ScopedSystemTestContext() {
         Tests::RestoreEdenPath(Common::FS::EdenPath::NANDDir, previous_nand);
+        Tests::RestoreEdenPath(Common::FS::EdenPath::SDMCDir, previous_sdmc);
         Settings::values.current_user = previous_user;
         Settings::values.memory_layout_mode.SetValue(previous_memory);
         Settings::values.use_multi_core.SetValue(previous_multicore);
@@ -34,6 +47,8 @@ public:
 private:
     const std::filesystem::path previous_nand =
         Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+    const std::filesystem::path previous_sdmc =
+        Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir);
     const s32 previous_user = Settings::values.current_user.GetValue();
     const Settings::MemoryLayout previous_memory = Settings::values.memory_layout_mode.GetValue();
     const bool previous_multicore = Settings::values.use_multi_core.GetValue();
