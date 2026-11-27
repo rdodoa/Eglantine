@@ -11,6 +11,9 @@ add_executable(tests
     video_core/unswizzle_workers.cpp
     video_core/block_linear_swizzle.cpp
     video_core/aftermath_dump.cpp
+    video_core/cdma_pusher_teardown.cpp
+    video_core/cdma_pusher_wait_stop.cpp
+    video_core/host1x_test_process.h
     video_core/frame_dump_schedule.cpp
     video_core/frame_dump_decode.cpp
     video_core/frame_gen_generations.cpp
@@ -44,6 +47,7 @@ add_executable(tests
     core/nx2_present_pacer.cpp
     core/nx2_present_queue.cpp
     core/nx2_syncpoint_allocator.cpp
+    core/nvdrv_syncpoint_complete.cpp
     core/nx2_fence_action.cpp
     core/nx2_frame_interval.cpp
     core/ldn_lan_protocol.cpp
